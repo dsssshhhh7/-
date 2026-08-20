@@ -1,0 +1,93 @@
+#!/bin/bash
+# ccroute —— Codex 原生任务消息的路由桥。
+#
+# 账本仍由 ccname / ccjoin / cctell / ccsay 维护；这个脚本只把 Markdown
+# 索引转换成稳定 JSON，供 Codex 调用 list_threads / send_message_to_thread。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+ACTION="${1:-self}"
+shift 2>/dev/null || true
+
+json_string() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  printf '"%s"' "$s"
+}
+
+json_error() {
+  printf '{"ok":false,"error":%s}\n' "$(json_string "$*")"
+  exit 1
+}
+
+case "$ACTION" in
+  self)
+    ID="$(t_sid)"
+    GROUPS_JSON="["
+    SEP=""
+    while IFS= read -r G; do
+      G="$(t_trim "$G")"
+      [ -n "$G" ] && [ "$G" != "-" ] || continue
+      GROUPS_JSON="${GROUPS_JSON}${SEP}$(json_string "$G")"
+      SEP=","
+    done <<< "$(printf '%s' "$(t_groups_of "$ID")" | tr ',' '\n')"
+    GROUPS_JSON="${GROUPS_JSON}]"
+    printf '{"ok":true,"threadId":%s,"alias":%s,"cwd":%s,"groups":%s}\n' \
+      "$(json_string "$ID")" "$(json_string "$(t_alias_of "$ID")")" "$(json_string "$PWD")" "$GROUPS_JSON"
+    ;;
+
+  resolve)
+    ALIAS_NAME="${1:-}"
+    [ -n "$ALIAS_NAME" ] || json_error "用法：ccroute resolve <代号>"
+    ID="$(t_id_of "$ALIAS_NAME")"
+    [ -n "$ID" ] || json_error "地址簿里没有代号【${ALIAS_NAME}】"
+    printf '{"ok":true,"threadId":%s,"alias":%s,"cwd":%s}\n' \
+      "$(json_string "$ID")" "$(json_string "$ALIAS_NAME")" "$(json_string "$(t_cwd_of "$ID")")"
+    ;;
+
+  members)
+    GROUP="${1:-}"
+    TARGET_ALIAS="${2:-}"
+    [ -n "$GROUP" ] || json_error "用法：ccroute members <组名> [代号]"
+    t_group_exists "$GROUP" || json_error "没有这个组：【${GROUP}】"
+    ME="$(t_sid)"
+    printf '{"ok":true,"recipients":['
+    SEP=""
+    while IFS= read -r ID; do
+      [ -n "$ID" ] || continue
+      [ "$ID" = "$ME" ] && continue
+      ALIAS_NAME="$(t_alias_of "$ID")"
+      [ -n "$TARGET_ALIAS" ] && [ "$ALIAS_NAME" != "$TARGET_ALIAS" ] && continue
+      printf '%s{"threadId":%s,"alias":%s,"role":%s,"group":%s}' \
+        "$SEP" "$(json_string "$ID")" "$(json_string "$ALIAS_NAME")" \
+        "$(json_string "$(t_member_role "$GROUP" "$ID")")" "$(json_string "$GROUP")"
+      SEP=","
+    done <<< "$(t_members_of "$GROUP")"
+    printf ']}\n'
+    ;;
+
+  message)
+    MID="${1:-}"
+    [ -n "$MID" ] || json_error "用法：ccroute message <消息号>"
+    FILE="$(find "$(t_myinbox)" -maxdepth 1 -type f -name "*-${MID}*.md" 2>/dev/null | head -1)"
+    [ -n "$FILE" ] || json_error "当前任务收件箱里找不到消息 ${MID}"
+    field() { sed -n "s/^$1:[[:space:]]*//p" "$FILE" | head -1; }
+    BODY="$(awk 'BEGIN{s=0} /^---[[:space:]]*$/{s++; next} s>=2{print}' "$FILE")"
+    DEPTH="$(field 接力深度)"
+    case "$DEPTH" in ''|*[!0-9]*) DEPTH=0 ;; esac
+    printf '{"ok":true,"file":%s,"group":%s,"messageId":%s,"from":%s,"fromThreadId":%s,"depth":%s,"urgent":%s,"kind":%s,"purpose":%s,"body":%s}\n' \
+      "$(json_string "$FILE")" "$(json_string "$(field 组)")" "$(json_string "$(field 消息号)")" \
+      "$(json_string "$(field 来自)")" "$(json_string "$(field 来自编号)")" "$DEPTH" \
+      "$(json_string "$(field 紧急)")" "$(json_string "$(field 类型)")" \
+      "$(json_string "$(field 发送目的)")" "$(json_string "$BODY")"
+    ;;
+
+  *)
+    json_error "不认识的动作：${ACTION}（支持 self / resolve / members / message）"
+    ;;
+esac

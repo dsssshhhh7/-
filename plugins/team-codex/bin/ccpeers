@@ -1,0 +1,145 @@
+#!/bin/bash
+# ccpeers —— 开会话时报一次「协作现状」：机器上有哪些组、我在哪些、还有谁跟我是同一个端
+#
+#   ccpeers          打印协作现状（挂在开会话时自动跑）
+#
+# 为什么要有这个：
+#   一个人常常同时开着好几个窗口，其中几个是同一个端（一个改代码、一个查 bug）。
+#   开窗口的那一刻他并不知道「机器上正在进行什么、另一个同端窗口在哪个组里干活」——
+#   于是同一件事被做两遍，或者该同步的结论没同步过去。
+#
+# ⚠️ 输出用【对齐好的纯文本】，不要用 markdown 表格。
+#    这段文字会通过 systemMessage 原样打到屏幕上，那个通道**不渲染 markdown** ——
+#    写成 | 组名 | 人数 | 人看到的就是一堆竖线。
+#    对齐靠 t_pad（它按显示宽度补空格，中文算两格），见 lib.sh。
+#
+# ⚠️ 只看得见【正在协作中】的会话。
+#    索引里只记在组的人，退出最后一个组时那条就被清掉了。
+#    所以「同角色的其他会话」实际是「同角色、且正在某个组里的会话」——
+#    你另开一个安卓窗口但没进组，它不会出现在这里，这是设计如此不是漏报。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+# 骨架都没建过 → 这台机器压根没用过协作，静默退出
+[ -d "$TEAM_ROOT" ] || exit 0
+[ -f "$INDEX_FILE" ] || exit 0
+
+ME="$(t_sid)"
+[ -n "$ME" ] || exit 0
+
+MY_ROLE="$(t_my_role)"
+MY_GROUPS="$(t_groups_of "$ME")"
+
+# 把家目录缩成 ~，路径太长会把表格撑得很难读
+short() { printf '%s' "${1/#$HOME/~}"; }
+
+echo "📋 协作现状"
+echo
+
+# ═════ 一、机器上有哪些讨论组 ═════
+#
+# ⚠️ 这一段是后加的：原先只报「我在哪些组」，结果新开的会话不在任何组时，
+#    只看到一句「你还没加入任何讨论组」—— 等于什么都没告诉他，
+#    他还得再问一句才知道机器上正在进行什么。开会话时该看到的是全貌。
+GN=0
+for gd in "$GROUPS_DIR"/*/; do [ -d "$gd" ] && GN=$((GN + 1)); done
+
+if [ "$GN" -eq 0 ]; then
+  echo "讨论组：本机现在一个都没有"
+else
+  echo "讨论组（共 ${GN} 个）"
+  printf '  %s%s%s%s%s\n' "$(t_pad '组名' 26)" "$(t_pad '人数' 6)" "$(t_pad '未读' 6)" "$(t_pad '最后活动' 14)" "我在吗"
+  printf '  %s\n' "──────────────────────────────────────────────────────────────"
+  for gd in "$GROUPS_DIR"/*/; do
+    [ -d "$gd" ] || continue
+    g="$(basename "$gd")"
+    mf="${gd}成员.md"
+    n=0
+    [ -f "$mf" ] && n="$(awk -F'|' '/^\|/ && $2 !~ /^[[:space:]]*(会话编号|-+)[[:space:]]*$/ { c++ } END { print c+0 }' "$mf" 2>/dev/null)"
+    mine="—"
+    [ -f "$mf" ] && grep -q "^| *${ME} *|" "$mf" 2>/dev/null && mine="✅ 代号 $(t_alias_of "$ME")"
+    lg="${gd}传话记录.md"
+    when=""
+    [ -f "$lg" ] && when="$(t_fmt_mtime "$lg" '+%m-%d %H:%M')"
+    # 这个组里所有成员的信箱加起来还压着多少条 —— 哪个组卡着，一眼看得出
+    gun=0
+    while IFS= read -r mid; do
+      [ -n "$mid" ] || continue
+      ib="$SESSIONS_DIR/$mid/收件箱"
+      [ -d "$ib" ] && gun=$(( gun + $(find "$ib" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ') ))
+    done <<< "$(awk -F'|' '/^\|/ && $2 !~ /^[[:space:]]*(会话编号|-+)[[:space:]]*$/ {
+                   gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2 }' "$mf" 2>/dev/null)"
+    [ "$gun" = "0" ] && gun="—"
+    printf '  %s%s%s%s%s\n' "$(t_pad "$g" 26)" "$(t_pad "$n" 6)" "$(t_pad "$gun" 6)" "$(t_pad "${when:-未知}" 14)" "$mine"
+  done
+fi
+echo
+
+# ═════ 二、我在的那些组里还有谁 ═════
+if [ -n "$MY_GROUPS" ] && [ "$MY_GROUPS" != "-" ]; then
+  echo "我所在的组，同组还有谁"
+  printf '  %s%s\n' "$(t_pad '组名' 26)" "同组成员"
+  printf '  %s\n' "──────────────────────────────────────────────────────────────"
+  printf '%s\n' "$MY_GROUPS" | tr ',' '\n' | while IFS= read -r g; do
+    g="$(t_trim "$g")"
+    [ -n "$g" ] || continue
+    mf="$(t_group_members "$g")"
+    [ -f "$mf" ] || continue
+    others=""
+    while IFS= read -r mid; do
+      [ -n "$mid" ] || continue
+      [ "$mid" = "$ME" ] && continue
+      a="$(t_alias_of "$mid")"
+      [ -n "$a" ] && others="${others:+${others} · }${a}"
+    done <<< "$(awk -F'|' '/^\|/ && $2 !~ /^[[:space:]]*(会话编号|-+)[[:space:]]*$/ {
+                   gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2 }' "$mf" 2>/dev/null)"
+    printf '  %s%s\n' "$(t_pad "$g" 26)" "${others:-（只有你一个）}"
+  done
+  echo
+fi
+
+# ═════ 三、谁跟我是同一个端 ═════
+#    判据是工作目录背后的 git 仓库，不是代号也不是目录名 —— 见 lib.sh 的 t_role_of_dir
+if [ -n "$MY_ROLE" ]; then
+  # ⚠️ 用临时文件收集，**不要包在 $( ) 里**。
+  #    实测：把这段带 case 的 while 循环放进命令替换，bash 3.2 会报
+  #    「syntax error near unexpected token newline」并把源码原样打出来。
+  TMPR="$(mktemp)"
+  grep '^|' "$INDEX_FILE" 2>/dev/null | while IFS='|' read -r _ id alias sysname cwd groups rest; do
+    id="$(t_trim "$id")"; alias="$(t_trim "$alias")"
+    cwd="$(t_trim "$cwd")"; groups="$(t_trim "$groups")"
+    [ -n "$id" ] || continue
+    [ "$id" = "会话编号" ] && continue
+    printf '%s' "$id" | grep -q '^-' && continue          # 分隔行
+    [ "$id" = "$ME" ] && continue
+    [ "$(t_role_of_dir "$cwd")" = "$MY_ROLE" ] || continue
+    # 未读数：数对方信箱里还剩几个消息文件（都在本机，查得到）。
+    # 有未读说明它手上还压着事 —— 你要找它对齐时，心里有个数。
+    ubox="$SESSIONS_DIR/$id/收件箱"
+    un=0
+    [ -d "$ubox" ] && un=$(find "$ubox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    [ "$un" = "0" ] && un="—"
+
+    # 有代号但一个组都没进，是正常状态（代号是窗口的身份，不是组籍）——
+    # 那一列显示成横杠会让人以为坏了，明说「未进组」
+    case "$groups" in ''|'-') groups="未进组" ;; esac
+
+    # 编号放最后一列并【完整显示】：它是唯一不变的寻址依据，截断了就没法直接拿去用
+    printf '  %s%s%s%s%s\n' \
+      "$(t_pad "$alias" 16)" "$(t_pad "$(short "$cwd")" 40)" \
+      "$(t_pad "$groups" 26)" "$(t_pad "$un" 6)" "$id" >> "$TMPR"
+  done
+  ROWS="$(cat "$TMPR" 2>/dev/null)"
+  rm -f "$TMPR"
+
+  if [ -n "$ROWS" ]; then
+    echo "同是【${MY_ROLE}】的其他会话"
+    printf '  %s%s%s%s%s\n' "$(t_pad '代号' 16)" "$(t_pad '工作目录' 40)" "$(t_pad '在哪些组' 26)" "$(t_pad '未读' 6)" "会话编号"
+    printf '  %s\n' "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    printf '%s\n' "$ROWS"
+  else
+    echo "同是【${MY_ROLE}】的其他会话：没有（这个端只有你一个窗口在协作里）"
+  fi
+fi
+
+exit 0

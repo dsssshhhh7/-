@@ -1,0 +1,273 @@
+#!/bin/bash
+# ccname —— 起代号 / 改代号
+#
+#   ccname <代号>                 还没有代号就是【登记】，已经有就是【改名】
+#   ccname <代号> --负责 "干什么"   顺手把职责写上
+#
+# 代号是**这个窗口的身份**，不是某个组的身份 ——
+# 所以不用先加入任何组就能登记，退出全部组之后它也留着。
+# 早先必须先 ccjoin 才能有代号，那是把身份和组籍绑在了一起：
+# 结果没进组的窗口在状态栏上永远显示「代号未登记」，而这类窗口恰恰最需要被认出来；
+# 退出全部组还会把代号一起丢掉，下次进组得重新起名。
+#
+# 编号不动，所以改名不影响任何协作关系 ——
+# 成员名单只记编号，代号只是显示时翻译出来的。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+NEW=""; ROLE=""; FORCE=0; CONFIRM=0; SAY_NO=0; CANCEL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --负责|--role)          ROLE="$2"; shift 2 ;;
+    --顶掉离线的|--force)    FORCE=1; shift ;;
+    --确认它真关了|--yes)    CONFIRM=1; shift ;;
+    --不用|--no)            SAY_NO=1; shift ;;
+    --注销|--cancel)        CANCEL=1; shift ;;
+    -*)                     t_die "不认识的参数：$1" ;;
+    *)                      NEW="$1"; shift ;;
+  esac
+done
+
+# 注销：把自己这行从索引里删掉，代号释放出去。
+# 收件程序会跟着自己下班（它的判据就是「还有代号吗」，连查 3 轮没有就退），
+# 于是别人的地址簿里也不再有你 —— 这就是方案里说的「不想要就去掉代号」那条出路。
+if [ "$CANCEL" -eq 1 ]; then
+  ME_NOW="$(t_sid)"
+  CUR="$(t_alias_of "$ME_NOW")"
+  [ -n "$CUR" ] || t_die "这个窗口本来就没有代号，没什么可注销的。"
+  GS="$(t_groups_of "$ME_NOW")"; [ "$GS" = "-" ] && GS=""
+  if [ -n "$GS" ]; then
+    echo "❌ 你还在这些组里：${GS}" >&2
+    echo "   现在注销代号，组里那几行就只剩一串没人认得的编号了。" >&2
+    echo "   先退组（/team leave 全部），再来注销。" >&2
+    exit 1
+  fi
+  t_lock 索引 || t_die "索引被占用"
+  t_index_remove "$ME_NOW"
+  t_unlock 索引
+  t_alias_history_add "$CUR" "$ME_NOW" "-" "本人注销"
+  t_ok "代号【${CUR}】已注销，这个名字可以被别的窗口用了。"
+  echo
+  if [ "${TEAM_RUNTIME}" = "codex" ]; then
+    echo "  这个任务已从 Codex 协作地址簿移除，不再接收按代号投递的原生消息。"
+  else
+    echo "  收件程序会自己下班（它的判据就是「还有代号吗」）——"
+    echo "  从此这个窗口收不到传话，在别人的地址簿里也不再出现。"
+  fi
+  echo "  信箱和会话目录没动，还在 $(t_mydir)"
+  echo "  想回来：再说一句「代号叫 <名字>」。"
+  exit 0
+fi
+
+# 人说「代号不用了」→ 留个标记，开窗口时不再引导。想登记时再说一句就恢复。
+if [ "$SAY_NO" -eq 1 ]; then
+  printf '人说过不需要代号。想登记的话跑：ccname <代号>\n' > "${TEAM_ROOT}/.no-alias"
+  t_ok "知道了，以后开窗口不再提代号这件事。"
+  echo "（哪天要用，说一句「代号叫 XXX」就行，这个标记会自动去掉）"
+  exit 0
+fi
+
+# 不带名字 = 想知道能叫什么。列候选让人挑，别让人自己去翻索引。
+if [ -z "$NEW" ]; then
+  ME_NOW="$(t_sid)"
+  echo "这个窗口现在的代号：$(t_alias_of "$ME_NOW" || true)"
+  [ -n "$(t_alias_of "$ME_NOW")" ] || echo "（还没有 —— 起一个才能收发传话）"
+  echo
+  echo "候选："
+  LASTNAME="$(awk -F'|' -v d="$PWD" '/^\|/ {
+      for (i = 2; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+      if ($5 == d && $3 != "" && $2 != "会话编号") print $3 }' "$INDEX_FILE" 2>/dev/null | tail -1)"
+  if [ -n "$LASTNAME" ] && [ "$LASTNAME" != "$(t_alias_of "$ME_NOW")" ]; then
+    HOLDER="$(t_id_of "$LASTNAME")"
+    printf '  · %s 这个目录上次用的' "$(t_pad "$LASTNAME" 16)"
+    if [ -n "$HOLDER" ] && [ "$HOLDER" != "$ME_NOW" ]; then
+      printf '（现在挂在 %s 上，%s）' "${HOLDER:0:8}…" "$(t_online_text "$HOLDER")"
+    fi
+    echo
+  fi
+  printf '  · %s 按目录名猜的\n' "$(t_pad "$(basename "$PWD")" 16)"
+  echo
+  echo "定了就说一句「代号叫 <名字>」。"
+  echo "不想要：ccname --不用（以后开窗口不再提）"
+  exit 0
+fi
+case "$NEW" in *\|*) t_die "代号里不能有竖线 |（会撑坏索引表格）" ;; esac
+[ ${#NEW} -le 20 ] || t_die "代号太长（超过 20 字），不好认"
+
+ME="$(t_sid)"
+OLD="$(t_alias_of "$ME")"
+
+# ── 查重与强制 ──
+#
+# 红线只有一条：**占用者还在任何一个讨论组里，就绝对不给，没有例外。**
+# 那些欠账（别人发给它没处理的、它发出去没人跟进的、它认领了没问完的）
+# 必须由**有对话上下文的那个窗口**自己处理完 —— 换个没上下文的窗口接过去只能瞎回。
+# 而且退组是有语义的动作（要通知全组、要把该组未读标成「仅供参考」），
+# 不该被「抢名字」这个动作附带触发。
+#
+# 在线与否一律看心跳，不问 Claude Code 的进程列表：那条要另起进程、还依赖 jq。
+owner="$(t_alias_taken_by_other "$NEW" "$ME")"
+if [ -n "$owner" ]; then
+  o_groups="$(t_groups_of "$owner")"
+  [ "$o_groups" = "-" ] && o_groups=""
+  o_age="$(t_offline_age "$owner")"
+  o_dir="$(_index_field "$owner" 4)"
+  o_inbox="$SESSIONS_DIR/$owner/收件箱"
+  o_unread=0
+  [ -d "$o_inbox" ] && o_unread=$(find "$o_inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+
+  # ── 红线：还在组里 ──
+  if [ -n "$o_groups" ]; then
+    echo "❌ 代号【${NEW}】不能给你 —— 它还在讨论组里：" >&2
+    while IFS= read -r g; do
+      [ -z "$g" ] && continue
+      if t_group_exists "$g"; then
+        printf '     · %s（%s 人，它负责：%s）\n' \
+          "$g" "$(t_members_of "$g" | wc -l | tr -d ' ')" "$(t_member_role "$g" "$owner")" >&2
+      else
+        # 组已经结案/删掉，索引这一行是旧的。不能因为一条过期记录把名字永久锁死，
+        # 但也不能在这儿自作主张改索引（那是对账的活），所以指路过去。
+        printf '     · %s（这个组已经没了，索引这行是旧的 —— 跑一次 ccsync 对账就能清掉）\n' "$g" >&2
+      fi
+    done <<< "$(printf '%s' "$o_groups" | tr ',' '\n')"
+    [ "$o_unread" -gt 0 ] && echo "   它信箱里还压着 ${o_unread} 条没处理的消息。" >&2
+    echo >&2
+    echo "   要放掉这个代号，只有一条路，三步都得在**那个窗口**里做：" >&2
+    echo "     1. 找回它：cd \"${o_dir:-<它原来的目录>}\" && claude --resume ${owner}" >&2
+    echo "     2. 在那个窗口里把欠账处理完（消息、认领）" >&2
+    echo "     3. 让它退组：/team leave（全部）" >&2
+    echo "   然后关掉那个窗口 —— 或者让它自己改个名字，代号立刻就能给你。" >&2
+    echo >&2
+    echo "   嫌麻烦就换一个名字：ccname \"<别的名字>\"。" >&2
+    echo "   多数时候你只是要个称呼，不是非要这个名字不可 —— 上面那三步是给「确实非它不可」准备的。" >&2
+    echo >&2
+    echo "   为什么不给硬抢：那些欠账只有它自己有上下文，换个窗口接过去只能瞎回。" >&2
+    exit 1
+  fi
+
+  # ── 不在任何组，但还在线 ──
+  if t_is_online "$owner"; then
+    echo "❌ 代号【${NEW}】正被一个**在线的**窗口用着（编号 ${owner}）。" >&2
+    echo "   活窗口的身份不能抢 —— 抢了它在别人眼里就没名字了。" >&2
+    echo "   两条路：去那个窗口让它自己改名 / 关掉它，或者你换一个名字。" >&2
+    exit 1
+  fi
+
+  # ── 不在组 + 离线：要显式说一句才顶 ──
+  if [ "$FORCE" -ne 1 ]; then
+    echo "❌ 代号【${NEW}】被一条**离线的**记录占着（编号 ${owner}，$(t_online_text "$owner")）。" >&2
+    echo "   它不在任何讨论组里，所以这个名字可以顶过来。" >&2
+    echo >&2
+    echo "   顶掉它：ccname \"${NEW}\" --顶掉离线的" >&2
+    echo "   还想接着那个窗口干：ccresume \"${NEW}\" 把它找回来，名字本来就是它的" >&2
+    echo "   都不想：ccname \"<别的名字>\" 换一个" >&2
+    exit 1
+  fi
+
+  # ── 刚离线不久：多问一句 ──
+  # 心跳只在收件程序跑着时才有 —— 一个开着但没起收件程序的窗口也显示离线。
+  if [ "$o_age" -ge 0 ] && [ "$o_age" -lt 600 ] && [ "$CONFIRM" -ne 1 ]; then
+    echo "⚠️  它只离线了 $((o_age / 60)) 分钟，可能只是**没起收件程序**，窗口其实还开着。" >&2
+    echo "   确认那个窗口真关了的话：ccname \"${NEW}\" --顶掉离线的 --确认它真关了" >&2
+    exit 1
+  fi
+
+  # ── 顶掉：只删索引那一行，别的什么都不动 ──
+  # 它不在任何组，所以没有成员表要改；它信箱里的未读原样留着，
+  # 将来把那个窗口找回来还能翻（退组时那些已经被标成「已退出仅供参考」了）。
+  t_lock 索引 || t_die "索引被占用"
+  t_index_remove "$owner"
+  t_unlock 索引
+  t_alias_history_add "$NEW" "$owner" "$ME" "顶掉离线记录（$(t_online_text "$owner")）"
+  t_ok "代号【${NEW}】已从那条离线记录上顶过来（原编号 ${owner}）"
+  [ "$o_unread" -gt 0 ] && echo "   ⚠️ 那个窗口信箱里还有 ${o_unread} 条未读，原样留在 ${o_inbox}，没搬也没删。"
+  echo
+fi
+
+t_ensure_mydir
+rm -f "${TEAM_ROOT}/.no-alias"      # 起了名字就说明要用，把「不用了」的标记撤掉
+
+t_lock 索引 || t_die "索引被占用"
+t_index_upsert "$ME" "$NEW" "$(t_groups_of "$ME")"
+t_unlock 索引
+
+# ── 名片 ──
+# 已有就只换代号那一行；没有（第一次登记）就现写一张。
+CARD="$(t_mydir)/名片.md"
+if [ -f "$CARD" ]; then
+  sed "s/^代号：.*/代号：${NEW}/" "$CARD" > "$CARD.t" && mv "$CARD.t" "$CARD"
+  [ -n "$ROLE" ] && { sed "s/^职责：.*/职责：${ROLE}/" "$CARD" > "$CARD.t" && mv "$CARD.t" "$CARD"; }
+else
+  GS="$(t_my_groups)"
+  cat > "$CARD" <<EOF
+# 名片
+
+代号：$NEW
+编号：$ME
+目录：$PWD
+职责：${ROLE:-（未填，建议补上——加工员靠这个判断消息跟你有没有关系）}
+
+## 当前加入的协作
+$([ -n "$GS" ] && printf '%s' "$GS" | sed 's/^/- /' || echo "（还没加入任何组）")
+
+> 这份名片是「当前状态」的权威记录。
+> 你关窗口期间组里可能变了，恢复回来读一眼这里和各组共识来对账。
+EOF
+fi
+
+# ── 输出 ──
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  if [ -z "$OLD" ]; then
+    t_ok "代号登记好了：【${NEW}】"
+    echo
+    echo "  这个代号绑定当前 Codex 任务编号，不依赖讨论组。"
+    echo "  点对点传话由 Codex 原生任务消息直接唤醒，不需要 watcher。"
+    [ -z "$(t_my_groups)" ] && echo "  当前还没加入讨论组；需要时说「/team join <组名>」。"
+  else
+    t_ok "代号已从【${OLD}】改成【${NEW}】"
+    echo "  任务编号没变，现有组籍和消息关系都保留。"
+  fi
+  echo "  Codex 会把任务标题前缀同步成【${NEW}】，用于一眼识别窗口。"
+  exit 0
+fi
+
+if [ -z "$OLD" ]; then
+  t_ok "代号登记好了：【${NEW}】"
+  echo
+  echo "  这是**这个窗口**的身份，跟在不在组里无关：进组、退组、退全部，它都在。"
+  # ⚠️ 这里以前写的是「零影响：不跑后台程序」——现在**不成立**了：
+  #    登记代号 = 接入传话台，别人随时可能传话进来，收件程序就该在岗。
+  #    口径要跟 ccme / ccwatchdog 一致，三处不能各说一套。
+  echo "  **登记代号 = 接入传话台**：别人可以直接传话给你（不用建组、不用进组）。"
+  echo "  所以这个窗口该有一个收件程序在岗 —— 不在岗的话，你在别人的地址簿里显示为「离线」，"
+  echo "  传话根本发不过来。它 5 秒扫一次文件、不思考、**不花词元**。"
+  if [ -z "$(t_my_groups)" ]; then
+    echo "  你现在没加入任何讨论组；要协作时再说一句「加入讨论组 X」。"
+  fi
+  echo "  彻底退出（代号也不要了）：ccname --注销"
+
+  # 登记完就把「起收件程序」这件事摆到会话面前，让它**当场就起**，别再回头问人一次。
+  # 脚本自己起不了：收件程序要把消息推进对话流，脚本起的进程输出没地方去，
+  # 只会变成又一个孤儿。所以这里能做的是——把起法连同解析好的真实路径打出来。
+  if ! t_watcher_running; then
+    echo
+    echo "🔔 【会话看这里】现在**立刻**用盯梢工具（Monitor）起收件程序，**不用回头问人**："
+    echo "     命令：$(t_bin_dir)/watcher.sh"
+    echo "     persistent：true"
+    echo "     描述：本会话收件箱的新消息"
+    echo "   起它不花词元，而且不起的话这个代号等于白登记 —— 别人看到的是「离线」，传话发不过来。"
+  fi
+  echo "  挂了状态栏的话（/team statusline），那一栏现在就会显示【${NEW}】。"
+else
+  t_ok "代号已从【${OLD}】改成【${NEW}】"
+  echo
+  echo "编号没变，所以协作关系一个都没断："
+  if [ -n "$(t_my_groups)" ]; then
+    t_my_groups | sed 's/^/  · /'
+  else
+    echo "  （当前没加入任何组）"
+  fi
+  echo
+  echo "组里其他人下次显示你的时候会自动用新代号（他们的名单里记的是编号）。"
+fi

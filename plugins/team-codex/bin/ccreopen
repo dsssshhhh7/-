@@ -1,0 +1,37 @@
+#!/bin/bash
+# ccreopen —— 从结案文档复活一个讨论组
+#   ccreopen <结案文档路径> [新组名]
+# 共识原样恢复；成员不自动拉回来 —— 各自重新 ccjoin，因为加入协作要本人点头。
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+DOC="$1"
+[ -n "$DOC" ] || t_die "用法：ccreopen <结案文档路径>    （跑 ccarchives 看有哪些）"
+[ -f "$DOC" ] || t_die "找不到这份文档：$DOC"
+
+G="$2"
+[ -n "$G" ] || G="$(basename "$DOC" .md | sed 's/-结案$//')"
+t_check_groupname "$G"
+t_group_exists "$G" && t_die "已经有一个叫【${G}】的组了。换个名字：ccreopen \"$DOC\" <新组名>"
+
+t_group_init "$G"
+
+# 把结案文档里「最终约定」那一节抽出来当共识
+CF="$(t_group_consensus "$G")"
+{
+  echo "# ${G} · 共识"
+  echo
+  echo "> 从结案文档复活：$DOC"
+  echo "> 下面是结案时的最终约定，原样恢复。"
+  echo
+  awk '/^## 最终约定/{f=1;next} /^## /{f=0} f' "$DOC"
+} > "$CF"
+
+t_log_append "$G" "$(t_msgid)" "系统" "—" "从结案文档复活：$(basename "$DOC")" "-"
+
+t_ok "已复活讨论组【${G}】，共识从结案文档恢复。"
+echo
+echo "成员没有自动拉回来 —— 各自去自己的窗口敲："
+echo "    ccjoin \"$G\" --代号 <代号> --负责 \"<干什么>\""
+echo
+echo "（加入协作要本人点头，不能替别的会话决定。）"

@@ -1,0 +1,102 @@
+#!/bin/bash
+# ccack —— 回执：谁收了、谁办了、谁没动静
+#
+#   ccack <组名>                          看最近 10 条消息的回执
+#   ccack <组名> --全部                    看全部
+#   ccack --处理 <组名> <消息号>            把某条标成「已处理」（会话处理完消息后调用）
+#
+# 回执两个符号：前=已送达（收件程序自动标），后=已处理（会话读完自己标）。
+# 送达≠处理 —— 送到了但对方在忙，你才知道该等还是该催。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+ME="$(t_sid)"
+
+# 待补回执：抢不到锁时先记下来，下次任何一次 ccack 顺手补上。
+#
+# ⚠️ 这是踩过坑加的（2026-08-17 四端联调实测）：
+#    原先抢组锁只等 5 秒，抢不到就 t_die 退出。而会话调用它时通常写成
+#    `ccack --处理 ... >/dev/null 2>&1`，报错被丢掉 —— 于是标记失败得无声无息。
+#    结果：接收方明明读完了整条消息，发送方看到的回执却是「··」（连送达都没达成），
+#    以为对方压根没收到。四个端同时往一个组里写的时候，锁很挤，这不是小概率。
+#
+#    现在改成：等久一点；仍抢不到就落盘记账，绝不丢。回执最终一定会对上。
+PENDING="$(t_mydir)/.pending-ack"
+
+_ack_do() {   # $1=组 $2=消息号 $3=我的代号；成功返回 0
+  t_group_exists "$1" || return 0          # 组没了（多半已结案），这条不用再补
+  t_lock "组-$1" 15 || return 1            # 等 15 秒，比原来的 5 秒宽裕得多
+  # 能处理必然已送达。会话处理得比收件程序标记还快时，
+  # 不补这一下会出现「·✓」这种自相矛盾的状态。
+  t_ack_update "$1" "$2" "$3" 1
+  t_ack_update "$1" "$2" "$3" 2
+  t_unlock "组-$1"
+  return 0
+}
+
+# 把之前欠下的补上（每次跑 ccack 都试一遍，成功的从账上划掉）
+_ack_flush() {
+  [ -f "$PENDING" ] || return 0
+  local my; my="$(t_alias_of "$ME")"
+  [ -n "$my" ] || return 0
+  local left="${PENDING}.tmp.$$" g m
+  : > "$left"
+  while IFS='|' read -r g m; do
+    [ -n "$g" ] && [ -n "$m" ] || continue
+    _ack_do "$g" "$m" "$my" || printf '%s|%s\n' "$g" "$m" >> "$left"
+  done < "$PENDING"
+  if [ -s "$left" ]; then mv "$left" "$PENDING"; else rm -f "$left" "$PENDING"; fi
+}
+
+# ── 标记已处理 ──
+if [ "$1" = "--处理" ] || [ "$1" = "--done" ]; then
+  G="$2"; MID="$3"
+  [ -n "$G" ] && [ -n "$MID" ] || t_die "用法：ccack --处理 <组名> <消息号>"
+
+  # 传话台的消息不属于任何组，回执追加到它的当日记录里 ——
+  # 走组那条会被「没有这个组」直接挡掉，回执就永远标不上。
+  if [ "$G" = "传话台" ]; then
+    MY="$(t_alias_of "$ME")"
+    [ -n "$MY" ] || t_die "你还没有代号"
+    t_talk_ack "$MID" "$MY" 已处理 && t_ok "已标记：${MID} 由【${MY}】处理完毕（传话台）" \
+      || t_warn "传话记录正被占用，${MID} 的已处理没标上，等会儿再标一次"
+    exit 0
+  fi
+
+  t_group_exists "$G" || t_die "没有这个组：$G"
+  MY="$(t_alias_of "$ME")"
+  [ -n "$MY" ] || t_die "你还没有代号"
+  _ack_flush
+  if _ack_do "$G" "$MID" "$MY"; then
+    t_ok "已标记：${MID} 由【${MY}】处理完毕"
+  else
+    # 抢不到锁也不算失败 —— 记下来，下次补。**绝不能静静丢掉**。
+    mkdir -p "$(dirname "$PENDING")" 2>/dev/null
+    printf '%s|%s\n' "$G" "$MID" >> "$PENDING"
+    t_warn "组文件正被别人占用，${MID} 的回执已记入待补账，下次跑 ccack 时自动补上。"
+  fi
+  exit 0
+fi
+
+# 查看回执之前，先把欠的补上（这样人一看表就是最新的）
+_ack_flush
+
+# ── 查看回执 ──
+G="$1"; LIMIT=10
+[ "$2" = "--全部" ] || [ "$2" = "--all" ] && LIMIT=99999
+[ -n "$G" ] || t_die "用法：ccack <组名>    （跑 ccgroups 看有哪些组）"
+t_group_exists "$G" || t_die "没有这个组：$G"
+
+echo "【${G}】最近的传话与回执："
+echo
+# 直接输出原始 markdown 表格，不重新排版 ——
+# 中文在终端里的显示宽度靠 printf 的 %-Ns 对不齐（它按字节算），
+# 硬截断还会切在多字节字符中间变成乱码。
+sed -n '5,6p' "$(t_group_log "$G")"
+awk 'NR>6 && /^\|/' "$(t_group_log "$G")" | tail -"$LIMIT"
+
+echo
+echo "  图例：前一个符号=已送达，后一个=已处理。✓ 达成，· 未达成"
+echo
+echo "  两个符号都是 · → 对方八成没开机（跑 ccwho \"${G}\" 看在线状态）"
+echo "  ✓· → 送到了但还没处理，可能正在忙"

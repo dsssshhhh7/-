@@ -1,0 +1,33 @@
+#!/bin/bash
+# ccarchives —— 列出所有已结案的协作
+#   ccarchives            列出
+#   ccarchives <关键词>    看某一份的全文
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+if [ -n "$1" ]; then
+  f="$(find "$CLOSED_DIR" -maxdepth 1 -name "*$1*.md" -type f 2>/dev/null | head -1)"
+  [ -n "$f" ] || t_die "没找到含【$1】的结案文档"
+  cat "$f"
+  exit 0
+fi
+
+files="$(find "$CLOSED_DIR" -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)"
+if [ -z "$files" ]; then
+  echo "还没有结案的协作。"
+  echo "需求做完上线后用 ccclose <组名> 结案 —— 会把共识和踩过的坑合成一份文档留下来。"
+  exit 0
+fi
+
+echo "已结案的协作："
+echo
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  name="$(basename "$f" .md)"
+  d="$(t_fmt_mtime "$f" "+%m-%d")"
+  info="$(grep -m1 '^起止：' "$f" 2>/dev/null | sed 's/^起止：//')"
+  printf '  %s 结案于 %s   %s\n' "$(t_pad "$name" 34)" "$d" "$info"
+done <<< "$files"
+echo
+echo "看全文：ccarchives <关键词>"
+echo "复活成讨论组：ccreopen \"$CLOSED_DIR/<文件名>.md\""

@@ -1,0 +1,196 @@
+#!/bin/bash
+# ccstatusline —— 状态栏入口：照常显示原来那条状态栏，末尾多一块「我在协作里是谁」
+#
+#   ccstatusline            正常跑（Claude Code 每 300 毫秒调一次，数据从标准输入送进来）
+#   ccstatusline --install   装到状态栏上（保存原配置 + 写稳定入口 + 打印要填的那行）
+#   ccstatusline --check [编号]  拿假数据跑一遍，看渲染出来长什么样、用的是哪个底座
+#   ccstatusline --no        人说不要，以后开窗口不再提这件事（想装了再 --install 就恢复）
+#
+# 为什么要这一层：代号是按【会话编号】记的，而状态栏那条命令拿不到自己的会话编号
+# ——它只在送进来的那份数据里。所以这里先把编号取出来、塞进环境变量，
+# 再交给底座去显示，代号那一小块才认得准是哪个窗口。
+#
+# 底座 = 你原来的状态栏。装的时候原样存到 ~/claude-team/.statusline/base.sh，
+# 插件哪天不在了，入口脚本会自动退回去跑它，状态栏不会变空。
+
+# lib.sh 默认拿不到会话编号就当场退出。状态栏走后门：**它不需要环境变量里的编号**
+# ——编号在每次送进来的数据里，下面自己取。要是被那道检查拦死，状态栏会整条变空。
+export TEAM_SKIP_SESSION_CHECK=1
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "Codex 没有 Claude Code 可编程状态栏；team Skill 会把代号挂在任务标题前缀。"
+  exit 0
+fi
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BADGE="${DIR}/ccbadge"
+SL_DIR="${TEAM_ROOT}/.statusline"
+BASE="${SL_DIR}/base.sh"
+# ⚠️ 这个文件名【故意用英文】，跟本项目其余中文文件名不一样：
+#    只有它要写进 settings.json、被 Claude Code 用「某个 shell」去执行，
+#    而那个 shell 在 Windows 上可能是 cmd —— 中文路径经 cmd 会被按 GBK 转码，
+#    到了 bash 手里就是乱码，直接「找不到文件」。
+#    实测踩过同一个坑：从 Mac 经 ssh 往那台 Windows 发带中文的命令，一律报
+#    「No such file or directory」，把中文换成通配符就好了。
+#    这个目录下的文件（base.sh、disabled）也一律用英文名 —— 它们要么被 exec、
+#    要么被脚本反复拼接，属于机器可读的东西，中文名在别的环境下容易出事。
+SHIM="${TEAM_ROOT}/statusline.sh"
+CFG_DIR="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+SETTINGS="${CFG_DIR}/settings.json"
+
+# ── 找 claude-hud：版本目录会变，取版本号最大的那个 ──
+#
+# ⚠️ 不用 sort -V：那是 GNU 特有的，Windows 的 Git Bash 上不一定有；
+#    而且这里的完整路径里本来就带点（`.claude`），按点分列排序会排错。
+#    所以只把【版本号那一段】补零成定长再比大小，纯 awk，哪儿都能跑。
+sl_find_hud() {
+  local d v key best="" bestkey=""
+  for d in "${CFG_DIR}"/plugins/cache/claude-hud/claude-hud/*/; do
+    [ -f "${d}dist/index.js" ] || continue
+    v="$(basename "${d}")"
+    key="$(printf '%s' "${v}" | awk -F. '{ printf "%05d%05d%05d%05d", $1+0, $2+0, $3+0, $4+0 }')"
+    if [ -z "${bestkey}" ] || [ "${key}" \> "${bestkey}" ]; then
+      bestkey="${key}"; best="${d}dist/index.js"
+    fi
+  done
+  [ -n "${best}" ] && printf '%s' "${best}"
+}
+sl_find_node() {
+  command -v node 2>/dev/null && return 0
+  for p in /opt/homebrew/bin/node /usr/local/bin/node; do
+    [ -x "${p}" ] && { printf '%s' "${p}"; return 0; }
+  done
+  return 1
+}
+
+# ═══════════════ 装到状态栏上 ═══════════════
+if [ "$1" = "--不用" ] || [ "$1" = "--no" ]; then
+  mkdir -p "${SL_DIR}"
+  printf '人说不要在状态栏上显示代号。想装的话跑：ccstatusline --install\n' > "${SL_DIR}/disabled"
+  t_ok "知道了，以后开窗口不再提这件事。"
+  echo "（哪天想装了跑 ccstatusline --install，这个标记会自动去掉）"
+  exit 0
+fi
+
+if [ "$1" = "--安装" ] || [ "$1" = "--install" ]; then
+  mkdir -p "${SL_DIR}"
+  rm -f "${SL_DIR}/disabled"        # 装了就说明想要，把「不用了」的标记撤掉
+
+  CUR=""
+  if [ -f "${SETTINGS}" ] && command -v jq >/dev/null 2>&1; then
+    CUR="$(jq -r '.statusLine.command // empty' "${SETTINGS}" 2>/dev/null)"
+  fi
+
+  case "${CUR}" in
+    *statusline.sh*|*状态栏.sh*)
+      echo "状态栏已经指向本插件的入口了，不用重复装。"
+      ;;
+    "")
+      echo "⚠️  settings.json 里现在没有状态栏配置 —— 装完只会显示代号，不会有别的信息。"
+      ;;
+    *)
+      if [ -f "${BASE}" ]; then
+        echo "底座已经存过一份，保留原样不动：${BASE}"
+      else
+        {
+          printf '#!/bin/bash\n'
+          printf '# 这是装 team 状态栏之前、你原来的那条状态栏命令，原样存下来的。\n'
+          printf '# 用途：① 代号那块挂在它后面显示；② 插件哪天不在了，自动退回来跑它。\n'
+          printf '%s\n' "${CUR}"
+        } > "${BASE}"
+        chmod +x "${BASE}"
+        printf '%s\n' "${CUR}" > "${SL_DIR}/original-statusline.txt"
+        echo "原来的状态栏命令已存到：${BASE}"
+      fi
+      ;;
+  esac
+
+  # 稳定入口：settings.json 里只填这个路径，插件升级（版本目录变了）也不用改
+  # 模板只维护一份（在 lib.sh 里），这里直接用 ——
+  # 两处各写一套的话，改了一处忘了另一处，装出来的入口就是旧的。
+  t_statusline_shim_text > "${SHIM}"
+  chmod +x "${SHIM}"
+  echo "状态栏入口已写好：${SHIM}"
+  echo
+  echo "最后一步要改 ${SETTINGS} 里的 statusLine，改成："
+  echo
+  # ⚠️ 这里打印【展开后的绝对路径】，不要打印 $HOME ——
+  #    状态栏那条命令由 Claude Code 交给「某个 shell」执行，在 Windows 上那可能是 cmd，
+  #    cmd 不认识 ${HOME} 这种写法，写进去就是一条永远跑不起来的命令。
+  #    公司那台 Windows 现有的状态栏配置也正是这个写法：bash /c/Users/Admin/….sh
+  printf '    "statusLine": { "type": "command", "command": "bash \\"%s\\"" }\n' "${SHIM}"
+  echo
+  echo "改完【重开一个窗口】才生效（状态栏配置是开窗口时读的）。"
+  echo "想还原：把 statusLine 换回 ${SL_DIR}/original-statusline.txt 里那行。"
+  exit 0
+fi
+
+# ═══════════════ 自检 ═══════════════
+if [ "$1" = "--自检" ] || [ "$1" = "--check" ]; then
+  TESTSID="${2:-$(t_sid)}"
+  echo "拿假数据跑一遍（会话编号：${TESTSID:-空}）"
+  echo "底座：$([ -f "${BASE}" ] && echo "${BASE}" || echo "没存底座，直接找 claude-hud")"
+  echo "claude-hud：$(sl_find_hud || echo 没找到)"
+  echo "代号：$(TEAM_HUD_SID="${TESTSID}" bash "${BADGE}" --文字)"
+  echo
+  echo "──────── 渲染结果 ────────"
+  printf '{"session_id":"%s","model":{"display_name":"Opus 5"},"workspace":{"current_dir":"%s","project_dir":"%s"},"transcript_path":"/dev/null"}\n' \
+    "${TESTSID}" "${PWD}" "${PWD}" | bash "${DIR}/ccstatusline"
+  echo "──────────────────────────"
+  exit 0
+fi
+
+# ═══════════════ 正常跑 ═══════════════
+IN="$(cat)"
+
+# 会话编号：状态栏送进来的那份数据里有，取出来传下去
+SID=""
+if command -v jq >/dev/null 2>&1; then
+  SID="$(printf '%s' "${IN}" | jq -r '.session_id // empty' 2>/dev/null)"
+fi
+[ -n "${SID}" ] || SID="$(printf '%s' "${IN}" \
+  | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+export TEAM_HUD_SID="${SID}"
+
+HUD="$(sl_find_hud)"
+NODE="$(sl_find_node)"
+
+BASE_IS_HUD=0
+[ -f "${BASE}" ] && grep -q "claude-hud" "${BASE}" 2>/dev/null && BASE_IS_HUD=1
+
+# 跑底座、把代号拼到第一行末尾。
+# 底座什么都没输出时（脚本坏了、缺依赖、被删了）**也要把代号显示出来** ——
+# 否则状态栏整条空掉，人只会以为是这个功能把状态栏搞坏了。
+sl_base_with_badge() {
+  local out b
+  out="$(printf '%s' "${IN}" | bash "${BASE}" 2>/dev/null)"
+  b="$(bash "${BADGE}" --文字)"
+  if [ -z "${out}" ]; then
+    printf '\033[2m%s\033[0m\n' "${b}"
+    return 0
+  fi
+  printf '%s' "${out}" | awk -v b="${b}" 'NR==1 { printf "%s \033[2m│ %s\033[0m\n", $0, b; next } { print }'
+}
+
+# 别人的底座（不是 claude-hud）→ 照跑 + 拼代号
+if [ -f "${BASE}" ] && [ "${BASE_IS_HUD}" -eq 0 ]; then
+  sl_base_with_badge
+  exit 0
+fi
+
+# claude-hud 底座 → 用它自带的额外标签，位置和配色都跟它原生的一致
+if [ -n "${HUD}" ] && [ -n "${NODE}" ]; then
+  printf '%s' "${IN}" | "${NODE}" "${HUD}" --extra-cmd "bash '${BADGE}'"
+  exit 0
+fi
+
+# claude-hud 找不到，但存过底座 → 照跑 + 拼代号
+if [ -f "${BASE}" ]; then
+  sl_base_with_badge
+  exit 0
+fi
+
+# 什么底座都没有 → 至少把代号显示出来
+bash "${BADGE}" --文字

@@ -1,0 +1,20 @@
+{
+  "description": "Codex team 协作：启动时注入当前任务身份和协作现状",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "commandWindows": "bash \"%PLUGIN_ROOT%/hooks/session-start.sh\"",
+            "timeout": 10,
+            "statusMessage": "正在加载多端协作状态",
+            "additionalContextLimit": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

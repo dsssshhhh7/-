@@ -1,0 +1,123 @@
+#!/bin/bash
+# ccleave —— 退出讨论组
+#
+#   ccleave <组名>     退出一个组
+#   ccleave --all      退出全部
+#
+# 退出最后一个组之后**不是什么都停**：代号还在 = 还接在传话台上，
+# 所以**收件程序要继续留着**（停了就收不到别人传的话，还会在地址簿里显示离线）。
+# 该停的只有加工员（它花钱）。真要彻底退出：ccname --注销。
+#
+# 注意：停加工员这一步脚本做不了，必须由会话执行（见 SKILL.md）。
+# 关窗口 ≠ 退出协作 —— 关了还在组里，消息照收，重开就能接上。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+ME="$(t_sid)"
+ALIAS="$(t_alias_of "$ME")"
+[ -n "$ALIAS" ] || t_die "你还没加入任何协作。"
+
+ALL=0; G=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --all|--全部) ALL=1; shift ;;
+    *)            G="$1"; shift ;;
+  esac
+done
+
+leave_one() {
+  local g="$1"
+  t_group_exists "$g" || { t_warn "组【${g}】已经不在了（可能已结案），只从索引里摘掉。"; return 0; }
+  t_is_member "$g" "$ME" || { t_warn "你本来就不在【${g}】里。"; return 0; }
+
+  t_lock "组-$g" || t_die "该组文件被占用，稍后重试"
+
+  # 从成员名单删掉我
+  local mf tmp; mf="$(t_group_members "$g")"; tmp="$mf.tmp.$$"
+  awk -F'|' -v id="$ME" '/^\|/ { m=$2; gsub(/^[ \t]+|[ \t]+$/,"",m); if (m==id) next } { print }' "$mf" > "$tmp"
+  mv "$tmp" "$mf"
+
+  # 传话记录落一行退出款，带编号 —— 本方案不设归档区，
+  # 将来想查「这串编号当初是谁」就从流水里搜。
+  t_log_append "$g" "$(t_msgid)" "${ALIAS}（${ME}）" "—" "退出本组" "-"
+  t_unlock "组-$g"
+
+  # 通知还在组里的人
+  local mid; mid="$(t_msgid)"
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    t_deliver "$m" "$g" "$ALIAS" "$ME" "【${ALIAS}】退出了本组。" 0 否 系统 "$mid" >/dev/null
+  done <<< "$(t_members_of "$g")"
+
+  # 我收件箱里这个组的未读，标成「已退出，仅供参考」
+  local n=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if grep -q "^组: ${g}$" "$f" 2>/dev/null; then
+      mv "$f" "${f%.md}-已退出仅供参考.md" 2>/dev/null && n=$((n+1))
+    fi
+  done <<< "$(find "$(t_myinbox)" -maxdepth 1 -name '*.md' -type f 2>/dev/null)"
+  [ "$n" -gt 0 ] && echo "  该组还有 ${n} 条未读，已标记为「已退出，仅供参考」，不再当任务执行。"
+
+  t_ok "已退出【${g}】"
+}
+
+# ── 执行退出 ──
+if [ "$ALL" -eq 1 ]; then
+  while IFS= read -r g; do [ -n "$g" ] && leave_one "$g"; done <<< "$(t_my_groups)"
+  REMAIN=""
+else
+  [ -n "$G" ] || t_die "用法：ccleave <组名>    或 ccleave --all"
+  leave_one "$G"
+  REMAIN="$(t_my_groups | grep -vxF "$G")"
+fi
+
+# ── 更新索引 ──
+# 退出全部组时**只清空组籍，代号留着** —— 代号是这个窗口的身份，不是某个组的。
+# 早先这里是整行删掉，代价是：下次进组要重新起名，而且原来那个名字可能已经被
+# 一条已关闭的记录占着，进都进不去。身份和组籍本来就是两回事，别再绑在一起。
+t_lock 索引 || t_die "索引被占用"
+if [ -z "$REMAIN" ]; then
+  t_index_upsert "$ME" "$ALIAS" ""
+else
+  t_index_upsert "$ME" "$ALIAS" "$(printf '%s' "$REMAIN" | tr '\n' ',' | sed 's/,$//')"
+fi
+t_unlock 索引
+
+echo
+if [ -z "$REMAIN" ]; then
+  echo "═══ 你已退出全部协作 ═══"
+  echo
+  echo "还要停掉这些（脚本做不了，请会话执行）："
+  # ⚠️ 收件程序**不要停**：退出全部组之后代号还在，你仍然接在传话台上，
+  #    停了就再也收不到别人传给你的话，而且在别人地址簿里显示为「离线」。
+  #    真要彻底退出是 ccname --注销，那时它自己会下班。
+  if t_watcher_running; then
+    echo "  · 收件程序：**继续留着**（PID $(cat "$(t_watcher_pidfile)" 2>/dev/null)）"
+    echo "      代号【${ALIAS}】还在 = 还接在传话台上，别人随时能传话给你；停了就收不到了。"
+    echo "      真要彻底退出：ccname --注销（那时它会自己下班）"
+  fi
+  [ -f "$(t_mydir)/.agent" ] && echo "  · 加工员（在岗）—— 让它结束"
+  echo "  · 共识沉淀机制 —— 值班守则失效，cctell 不再自动写共识"
+  echo
+  echo "代号【${ALIAS}】留着（它是这个窗口的身份，不是某个组的）——"
+  echo "索引里那行还在，只是「在哪些组」空了；挂了状态栏的话那一栏照样显示它。"
+  echo "收件箱文件保留不删，收件程序也照旧盯着 —— 你还在传话台上。"
+  echo "（连代号一起放掉：ccname --注销，代号释放，收件程序跟着下班）"
+  rm -f "$(t_mydir)/.gear"
+
+  # 名片是「当前状态」的权威记录 —— 组都退了，那一节不能还写着旧的
+  CARD="$(t_mydir)/名片.md"
+  if [ -f "$CARD" ]; then
+    awk '
+      /^## 当前加入的协作/ { print; print ""; print "（已退出全部协作）"; print ""; skip = 1; next }
+      skip && /^>/ { skip = 0 }
+      skip { next }
+      { print }
+    ' "$CARD" > "$CARD.t" 2>/dev/null && mv "$CARD.t" "$CARD"
+  fi
+else
+  echo "你还在这些协作里，机制继续运行："
+  printf '%s\n' "$REMAIN" | sed 's/^/  · /'
+fi

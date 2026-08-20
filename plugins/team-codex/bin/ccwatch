@@ -1,0 +1,68 @@
+#!/bin/bash
+# ccwatch —— 切换收消息的档位
+#
+#   ccwatch              看当前档位
+#   ccwatch simple       只用收件程序，消息原样送达            不花钱（默认）
+#   ccwatch smart        加上加工员，消息经过分级/过滤/合并    每条约 1.1 万词元
+#   ccwatch off          临时全关，专心干活时用
+#
+# 加工员是【每个会话一个】的，不是全局共用。
+# 四个会话都开 smart，就是四份成本 —— 通常只有消息最杂的那个会话需要它。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "Codex 固定使用原生任务消息通道；无需切 simple/smart/off 档位。"
+  exit 0
+fi
+t_ensure_skeleton
+t_ensure_mydir
+
+MODE_FILE="$(t_mydir)/.gear"
+CUR="$(cat "$MODE_FILE" 2>/dev/null || echo simple)"
+
+if [ -z "$1" ]; then
+  echo "当前档位：${CUR}"
+  echo
+  case "$CUR" in
+    simple) echo "  收件程序在岗，消息原样送达，不做判断。不花钱。" ;;
+    smart)  echo "  加工员会先看一眼再决定怎么给你，会花钱。" ;;
+    off)    echo "  全关。消息照样进信箱，但没人叫你 —— 要手动 ccinbox 看。" ;;
+  esac
+  echo
+  echo "切换：ccwatch simple | smart | off"
+  exit 0
+fi
+
+case "$1" in
+  simple|smart|off) ;;
+  *) t_die "只能是 simple / smart / off" ;;
+esac
+
+echo "$1" > "$MODE_FILE"
+t_ok "档位：${CUR} → $1"
+echo
+
+case "$1" in
+  simple)
+    echo "消息会原样送到你面前，不分级不过滤。不花钱。"
+    [ -f "$(t_mydir)/.agent" ] && echo "⚠️  加工员还在岗 —— 用不上了，跑 ccrest 让它下班省钱。"
+    ;;
+  smart)
+    echo "接下来消息会先经过加工员：分紧急度、看跟你手头的事有没有关系、"
+    echo "把零碎的合并、它自己能答的直接答掉（这条最省往返）。"
+    echo
+    if [ -f "$(t_mydir)/.agent" ]; then
+      echo "加工员已在岗。"
+    else
+      echo "⚠️  加工员还没上岗 —— 会话现在就起一个（见 SKILL.md「起加工员」）。"
+      echo "    没起的话这个档位等于白开，行为跟 simple 一样。"
+    fi
+    ;;
+  off)
+    # off 档管的是「要不要加工员」，不是「要不要收件程序」。
+    # 收件程序停了就收不到传话、在别人地址簿里显示离线，跟档位无关。
+    echo "加工员该停掉（脚本停不了，请会话执行）。**收件程序继续留着** ——"
+    echo "档位管的是要不要加工员，不是要不要收消息；停了收件程序就收不到别人传的话了。"
+    ;;
+esac

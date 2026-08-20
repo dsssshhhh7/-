@@ -1,0 +1,558 @@
+#!/bin/bash
+# ccstatus —— 讨论组的状态：准备中 / 就绪
+#
+#   ccstatus <组名>                      看当前状态
+#   ccstatus <组名> --素材 "..."          管理员登记原始材料（需求文档路径/链接/口述描述）
+#   ccstatus <组名> --产出 "..."          管理员登记「结论还要同步到哪些组外文档」
+#   ccstatus <组名> --讨论内容 "..."      管理员设置这个组要讨论什么
+#   ccstatus <组名> --就绪 --人已同意     管理员置为「就绪」（有门槛，见下）
+#   ccstatus <组名> --准备中              管理员打回「准备中」
+#
+# 为什么要有这个状态：
+#   建组的人就是管理员，它得先把「讨论什么」和「方向性的事」跟人谈定，
+#   才能让各端开工。没有这道闸门，就会出现「带着自己形成的结论去建组、
+#   两分钟写满共识、然后才派活、还附一句别推翻」——最晚进组的人根本没机会反对。
+#
+# 置为「就绪」的门槛（六条都要满足，缺一不可）：
+#   0. 素材来源已登记（要处理的东西是什么、原始材料在哪）—— 最前置，没它没法深挖
+#   1. 讨论内容已设置（这个组要解决什么，说清楚了）
+#   2. 共识里有实质内容（方向已经跟人谈定并记下来了）
+#   3. 深度思考扫描走完了（ccthink：11 个维度全扫过 + 最后自查，或人喊停）
+#   4. 共识里没有「未经人逐字核对」的条目（每条都要人逐字过目）
+#   5. --人已同意（人明确点头「可以就绪、各端可以进来了」）
+#
+# 第 3 条为什么是必须的：
+#   前两条是机械检查——文件里有字就算过。会话完全可以自己把讨论内容写好、
+#   自己把共识 pin 满，然后自己宣布就绪，全程不问人一句。
+#   实跑中就这么发生过：会话按守则走完两道门槛，顺手置了就绪，人事后才知道。
+#   「就绪」的含义是【各端可以进来开工了】，这是一个只有人能下的判断——
+#   共识里的方向对不对、够不够、要不要现在就放人进来，机械检查一条都答不了。
+#   所以照 ccpin 的办法：把「人点头」这件事显式说出来，而不是顺手完成。
+#
+# 生命周期：准备中 → 就绪 → 结案（结案用 ccclose，那是需求真做完了）。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+G="$1"; shift 2>/dev/null
+[ -n "$G" ] || t_die "用法：ccstatus <组名> [--讨论内容 \"...\" | --就绪 | --准备中]"
+t_group_exists "$G" || t_die "没有这个组：$G"
+
+ME="$(t_sid)"
+GD="$(t_group_dir "$G")"
+SF="$GD/状态.md"
+MF="$(t_group_members "$G")"
+CF="$(t_group_consensus "$G")"
+
+# ── 管理员 = 建组的人 = 成员表里第一行那个会话 ──
+t_admin_of() {
+  grep -E '^\| [0-9a-f]{8}-' "$MF" 2>/dev/null | head -1 | awk -F'|' '{print $2}' | tr -d ' '
+}
+
+# ── 状态文件不存在就补一个 ──
+#
+# 这套状态机是后加的，之前建的组都没有状态文件。如果一律当「准备中」，
+# 那些正在跑的老组会突然不让人加入 —— 所以这里做一次推断：
+# 已经有多个成员、而且共识里有内容的，说明它早就在正常跑了，直接认定「就绪」。
+if [ ! -f "$SF" ]; then
+  ADMIN="$(t_admin_of)"
+  # ⚠️ 不要写成 grep -c ... || echo 0：grep 没匹配到时【既输出 0、又返回失败】，
+  #    那个 || 会再补一个 0，变量变成 "0\n0"，后面的数值比较直接报
+  #    "integer expression expected"。用 wc -l 数，它永远只输出一个数。
+  MEM_N=$(grep -E '^\| [0-9a-f]{8}-' "$MF" 2>/dev/null | wc -l | tr -d ' ')
+  CONS_N=$(t_consensus_real_lines "$CF")
+  if [ "$MEM_N" -ge 2 ] && [ "$CONS_N" -ge 1 ]; then
+    INIT="就绪"; INIT_NOTE="（老组，建状态记录时已有 ${MEM_N} 名成员、共识 ${CONS_N} 行，判定为早已在跑）"
+  else
+    INIT="准备中"; INIT_NOTE=""
+  fi
+  {
+    printf '# 讨论组状态 · %s\n\n' "$G"
+    printf -- '- **当前状态**：%s\n' "$INIT"
+    printf -- '- **管理员**：%s\n\n' "$ADMIN"
+    printf '## 讨论内容（只有管理员能设置）\n\n（还没设置）\n\n'
+    printf '## 素材来源（这个组要处理的东西是什么、原始材料在哪）\n\n（还没登记）\n\n'
+    printf '## 产出去向（这个组的结论还要同步到哪些组外的文档）\n\n（还没登记）\n\n'
+    printf '## 待人拍板（谁认领了 · 问完写进了哪一节）\n\n（还没有人认领）\n\n'
+    printf '## 状态变更记录\n\n- %s 建立状态记录，初始「%s」%s\n' "$(t_now)" "$INIT" "$INIT_NOTE"
+  } > "$SF"
+fi
+
+# 待人拍板节是后加的，老组没有 —— 补一个，插在「状态变更记录」前面
+#
+# 为什么要这一节：规矩里写着「认领前先看一眼有没有人已经问过」，
+# 但「看」这个动作原先没有落点 —— 要确认得回头翻收件箱里所有消息，而消息还在排队。
+# 实测出过：两个端在同一分钟里各自认领同一条，两人都在组里说了「我去问、你别问」。
+# 有了这一节，「看」变成扫一眼固定位置。（这条是 java+web 提的。）
+if ! grep -q '^## 待人拍板' "$SF"; then
+  _L3="$(grep -n '^## 状态变更记录' "$SF" | head -1 | cut -d: -f1)"
+  if [ -n "$_L3" ]; then
+    _T3="$SF.ptmp.$$"
+    head -n "$((_L3 - 1))" "$SF" > "$_T3"
+    printf '## 待人拍板（谁认领了 · 问完写进了哪一节）\n\n（还没有人认领）\n\n' >> "$_T3"
+    tail -n "+$_L3" "$SF" >> "$_T3"
+    mv "$_T3" "$SF"
+  fi
+fi
+
+# 产出去向节是后加的，老组没有 —— 补一个，插在「状态变更记录」前面
+if ! grep -q '^## 产出去向' "$SF"; then
+  _L2="$(grep -n '^## 状态变更记录' "$SF" | head -1 | cut -d: -f1)"
+  if [ -n "$_L2" ]; then
+    _T2="$SF.otmp.$$"
+    head -n "$((_L2 - 1))" "$SF" > "$_T2"
+    printf '## 产出去向（这个组的结论还要同步到哪些组外的文档）\n\n（还没登记）\n\n' >> "$_T2"
+    tail -n "+$_L2" "$SF" >> "$_T2"
+    mv "$_T2" "$SF"
+  fi
+fi
+
+# 素材节是后加的，老组的状态文件没有 —— 补一个，插在「状态变更记录」前面
+if ! grep -q '^## 素材来源' "$SF"; then
+  _L="$(grep -n '^## 状态变更记录' "$SF" | head -1 | cut -d: -f1)"
+  if [ -n "$_L" ]; then
+    _T="$SF.mtmp.$$"
+    head -n "$((_L - 1))" "$SF" > "$_T"
+    printf '## 素材来源（这个组要处理的东西是什么、原始材料在哪）\n\n（还没登记）\n\n' >> "$_T"
+    tail -n "+$_L" "$SF" >> "$_T"
+    mv "$_T" "$SF"
+  fi
+fi
+
+ADMIN="$(grep -E '^- \*\*管理员\*\*：' "$SF" | head -1 | sed 's/.*：//' | tr -d ' ')"
+[ -n "$ADMIN" ] || ADMIN="$(t_admin_of)"
+CUR="$(grep -E '^- \*\*当前状态\*\*：' "$SF" | head -1 | sed 's/.*：//' | tr -d ' ')"
+[ -n "$CUR" ] || CUR="准备中"
+ADMIN_ALIAS="$(t_alias_of "$ADMIN")"; [ -n "$ADMIN_ALIAS" ] || ADMIN_ALIAS="$ADMIN"
+
+# 讨论内容：取「## 讨论内容」和「## 状态变更记录」之间的正文
+# 读某一节的正文 = 从该节标题的下一行，读到【下一个 ## 之前】。
+# 不能写死读到「状态变更记录」——中间新增任何一节都会被误读进来。
+t_section_text() {
+  awk -v sec="$1" '$0 ~ "^## " sec {f=1;next} /^## /{f=0} f' "$SF" | sed '/^[[:space:]]*$/d'
+}
+t_topic_text() { t_section_text "讨论内容"; }
+TOPIC="$(t_topic_text)"
+t_material_text() { t_section_text "素材来源"; }
+t_output_text() { t_section_text "产出去向"; }
+MAT="$(t_material_text)"
+MAT_OK=0
+[ -n "$MAT" ] && ! printf '%s' "$MAT" | grep -q '还没登记' && MAT_OK=1
+OUT="$(t_output_text)"
+OUT_OK=0
+[ -n "$OUT" ] && ! printf '%s' "$OUT" | grep -q '还没登记' && OUT_OK=1
+TOPIC_OK=0
+[ -n "$TOPIC" ] && ! printf '%s' "$TOPIC" | grep -q '还没设置' && TOPIC_OK=1
+
+# 共识有没有实质内容：去掉标题、引用说明、空行、占位句之后还剩几行
+CONS_LINES=$(t_consensus_real_lines "$CF")
+CONS_OK=0
+[ "$CONS_LINES" -ge 1 ] && CONS_OK=1
+
+t_require_admin() {
+  [ "$ME" = "$ADMIN" ] || t_die "只有管理员（${ADMIN_ALIAS}）能改这个组的状态。你不是。"
+}
+
+t_set_state() {
+  local NEW="$1" NOTE="$2"
+  t_lock "组-$G" || t_die "该组文件被占用"
+  local TMP="$SF.tmp.$$"
+  sed "s/^- \*\*当前状态\*\*：.*/- **当前状态**：${NEW}/" "$SF" > "$TMP" && mv "$TMP" "$SF"
+  printf -- '- %s 由 %s 改为「%s」%s\n' "$(t_now)" "$(t_alias_of "$ME")" "$NEW" "$NOTE" >> "$SF"
+  t_unlock "组-$G"
+  grep -qE "^- \*\*当前状态\*\*：${NEW}$" "$SF" || t_die "状态没写进去，文件可能被占用，请重试"
+}
+
+case "$1" in
+  # ── 认领一条待人拍板的事 ──
+  #
+  # 认领之前先把现有的认领**打出来给你看**，而不是替你判断「像不像同一件事」——
+  # 那件事脚本做不了（实测两条认领分别写成「绿色标识做不做」和「被@标识按图还是按文字」，
+  # 任何字面匹配都对不上，但它们是同一件事）。**脚本负责让你看得见，判断仍然是你的。**
+  --认领|--claim)
+    BODY="$2"; [ -n "$BODY" ] || t_die "用法：ccstatus \"$G\" --认领 \"这条待人拍板的事是什么\""
+    t_reject_heading "$BODY" "状态"
+    OPEN="$(awk '/^## 待人拍板/{f=1;next} /^## /{f=0} f' "$SF" | grep '^- \[ \]' || true)"
+    if [ -n "$OPEN" ]; then
+      echo "⚠️  先看一眼 —— 现在还挂着这些没问完的，其中有跟你要认领的是同一件事吗？"
+      echo
+      printf '%s\n' "$OPEN" | sed 's/^- \[ \] /     · /'
+      echo
+      echo "   **是同一件事就别重复认领**，去找那个人问进度。"
+      echo "   实测出过：两个端在同一分钟里各自认领同一条，两人还都在组里说了「我去问、你别问」。"
+      echo
+    fi
+    t_lock "组-$G" || t_die "该组文件被占用"
+    grep -q '^（还没有人认领' "$SF" && { grep -v '^（还没有人认领' "$SF" > "$SF.c.$$" && mv "$SF.c.$$" "$SF"; }
+    A="$(grep -n '^## 待人拍板' "$SF" | head -1 | cut -d: -f1)"
+    B="$(awk -v h="$A" 'NR>h && /^## /{print NR; exit}' "$SF")"
+    [ -n "$B" ] || B="$(grep -n '^## 状态变更记录' "$SF" | head -1 | cut -d: -f1)"
+    TMP="$SF.tmp.$$"
+    head -n "$((B - 1))" "$SF" > "$TMP"
+    printf -- '- [ ] %s · 认领：%s · %s\n' "$BODY" "$(t_alias_of "$ME")" "$(t_now)" >> "$TMP"
+    tail -n "+$B" "$SF" >> "$TMP"
+    mv "$TMP" "$SF"
+    t_unlock "组-$G"
+    grep -qF "$BODY" "$SF" || t_die "没写进去，请重试"
+    t_ok "已认领：${BODY}"
+    echo
+    echo "接下来：① 在组里广播一句「这条我去问」（别人不一定会来翻这份状态）"
+    echo "        ② 问完回来 ccstatus \"$G\" --已问 \"$BODY\" --写进 \"<共识哪一节>\""
+    echo "        ③ 广播结论时**一并说写进了哪一节** —— 不说的话，别人做整体核对会再写一遍"
+    ;;
+
+  # ── 撤掉一条自己认领的事 ──
+  #
+  # 为什么必须有这条：认领时只警告不拦截（像不像同一件事，脚本判不了，得人看）。
+  # 于是重复认领一定会发生 —— 而守则接着说「是同一件事就别重复认领」，
+  # 人照做时却发现没有撤销的命令，只能去手改文件。（真机验收中由测试1 窗口提出）
+  # 只能撤自己的：别人那条背后有他自己的上下文，替他撤等于替他决定不问了。
+  --撤销认领|--unclaim)
+    BODY="$2"; [ -n "$BODY" ] || t_die "用法：ccstatus \"$G\" --撤销认领 \"认领时写的那句\""
+    grep -qF -- "- [ ] $BODY ·" "$SF" || {
+      echo "❌ 待人拍板里没有这一条没问完的认领（要逐字对上认领时写的那句）。现在挂着的是：" >&2
+      awk '/^## 待人拍板/{f=1;next} /^## /{f=0} f' "$SF" | grep '^- \[ \]' | sed 's/^- \[ \] /     · /' >&2
+      exit 1; }
+    _WHO="$(grep -F -- "- [ ] $BODY ·" "$SF" | head -1 | sed 's/.* · 认领：//; s/ · .*//')"
+    _ME_A="$(t_alias_of "$ME")"
+    if [ "$_WHO" != "$_ME_A" ]; then
+      echo "❌ 这条是【${_WHO}】认领的，你撤不了。" >&2
+      echo "   它为什么要问、问到哪一步了，只有它自己知道 —— 替它撤等于替它决定不问了。" >&2
+      echo "   去组里问它进度：cctell \"$G\" --给 \"${_WHO}\" --目的 \"问认领进度\" \"...\"" >&2
+      exit 1
+    fi
+    t_lock "组-$G" || t_die "该组文件被占用"
+    _T="$SF.unc.$$"
+    grep -vF -- "- [ ] $BODY · 认领：${_ME_A} ·" "$SF" > "$_T" && mv "$_T" "$SF"
+    rm -f "$_T"
+    t_unlock "组-$G"
+    if grep -qF -- "- [ ] $BODY · 认领：${_ME_A} ·" "$SF"; then
+      t_die "没撤掉，请重试"
+    fi
+    t_ok "已撤销认领：${BODY}"
+    echo "   这条现在没人认领了 —— 该问的话记得在组里说一声谁去问。"
+    ;;
+
+  # ── 把认领的那条标成问完了，并记下结论写进了哪一节 ──
+  --已问|--asked)
+    BODY="$2"; [ -n "$BODY" ] || t_die "用法：ccstatus \"$G\" --已问 \"认领时写的那句\" --写进 \"共识哪一节\""
+    SECT=""; shift 2
+    while [ $# -gt 0 ]; do case "$1" in --写进|--section) SECT="$2"; shift 2 ;; *) shift ;; esac; done
+    [ -n "$SECT" ] || t_die "还差一样：结论写进了共识哪一节？加 --写进 \"<节名>\"
+   这一栏不能省 —— 只说结论不说写在哪，别人做整体核对时会再写一遍，共识里就出现两份全文（实测发生过）。"
+
+    # ⚠️ 光要求「说出节名」是不够的 —— 原先这一栏只是被记进状态文件，
+    #    共识里有没有这个节、那节是不是空的、到底 ccpin 过没有，一概不看。
+    #    于是「问完人、随口填个节名、根本不写共识」照样放行，这道检查给的是虚假保证。
+    #    （实测现场：主控作废一条认领时，--写进 填的是一整段说明文字而不是节名，代码照收。）
+    if ! t_consensus_has_section "$CF" "$SECT"; then
+      echo "❌ 共识里没有「${SECT}」这一节。" >&2
+      echo >&2
+      echo "   现有的节是：" >&2
+      grep '^## ' "$CF" 2>/dev/null | sed 's/^## /     · /' >&2
+      echo >&2
+      echo "   --写进 要填的是【节名】，不是一段说明。先用 ccpin 把结论写进某一节，再来标问完。" >&2
+      exit 1
+    fi
+    if [ "$(t_consensus_section_lines "$CF" "$SECT")" -eq 0 ]; then
+      echo "❌ 共识的「${SECT}」这一节还是空的 —— 结论没真写进去。" >&2
+      echo >&2
+      echo "   先写：ccpin \"$G\" \"<问出来的结论>\" --节 ${SECT} --核对 已" >&2
+      echo "   写完再回来标问完。" >&2
+      exit 1
+    fi
+    grep -qF -- "- [ ] $BODY" "$SF" || {
+      echo "❌ 待人拍板里没有这一条（要逐字对上认领时写的那句）。现在挂着的是：" >&2
+      awk '/^## 待人拍板/{f=1;next} /^## /{f=0} f' "$SF" | grep '^- \[ \]' | sed 's/^- \[ \] /     · /' >&2
+      exit 1; }
+    t_lock "组-$G" || t_die "该组文件被占用"
+    # 这里原先调 python3。公司 Windows 上 python3 是个应用商店占位程序 ——
+    # 它什么都不做就退出，文件一个字没改，而下面照样报「已标记问完」：
+    # 静默失败，认领永远挂着，谁也不知道问过了。改成纯 awk，再加一道写入核实。
+    _T="$SF.ask.$$"
+    awk -v body="$BODY" -v sect="$SECT" -v now="$(t_now)" '
+      !done && index($0, "- [ ] " body " ·") == 1 {
+        p = index($0, " · 认领：")
+        if (p > 0) {
+          head = substr($0, 1, p - 1); sub(/^- \[ \] /, "- [x] ", head)
+          rest = substr($0, p + length(" · 认领："))
+          q = index(rest, " · ")
+          who = (q > 0 ? substr(rest, 1, q - 1) : rest)
+          print head " · 认领：" who " · **结论写进：" sect "** · 问完 " now
+          done = 1; next
+        }
+      }
+      { print }
+    ' "$SF" > "$_T" && mv "$_T" "$SF"
+    rm -f "$_T"
+    t_unlock "组-$G"
+    if ! grep -qF -- "- [x] $BODY ·" "$SF"; then
+      echo "❌ 没改成：待人拍板里那条还是没问完的状态。" >&2
+      echo "   你的结论没丢（已经在共识里了），但这条认领还挂着，请重试一次。" >&2
+      exit 1
+    fi
+    t_ok "已标记问完，结论写进【${SECT}】"
+    echo
+    echo "别忘了在组里广播：结论是什么 + 写进了哪一节。"
+    ;;
+
+  --讨论内容|--topic)
+    t_require_admin
+    BODY="$2"; [ -n "$BODY" ] || t_die "用法：ccstatus \"$G\" --讨论内容 \"这个组要解决什么\""
+    t_reject_heading "$BODY" "状态"
+    t_lock "组-$G" || t_die "该组文件被占用"
+    HEAD_LINE="$(grep -n '^## 讨论内容' "$SF" | head -1 | cut -d: -f1)"
+    # ⚠️ 结束边界必须取【紧跟其后的那个节】，不能直接取「状态变更记录」——
+    #    中间夹着素材节，取远了会把它整段冲掉（自测揪出来的真 bug）。
+    TAIL_LINE="$(awk -v h="$HEAD_LINE" 'NR>h && /^## /{print NR; exit}' "$SF")"
+    [ -n "$TAIL_LINE" ] || TAIL_LINE="$(grep -n '^## 状态变更记录' "$SF" | head -1 | cut -d: -f1)"
+    TMP="$SF.tmp.$$"
+    head -n "$HEAD_LINE" "$SF" > "$TMP"
+    printf '\n%s\n\n' "$BODY" >> "$TMP"
+    tail -n "+$TAIL_LINE" "$SF" >> "$TMP"
+    mv "$TMP" "$SF"
+    printf -- '- %s 由 %s 设置了讨论内容\n' "$(t_now)" "$(t_alias_of "$ME")" >> "$SF"
+    t_unlock "组-$G"
+    grep -qF "$(printf '%s' "$BODY" | head -1 | cut -c1-20)" "$SF" || t_die "讨论内容没写进去，请重试"
+    t_ok "已设置【${G}】的讨论内容"
+    echo; echo "$BODY"; echo
+    echo "下一步：把方向性的事跟人谈定、用 ccpin 写进共识，然后【问人是否可以就绪】，"
+    echo "        人点头后：ccstatus \"$G\" --就绪 --人已同意"
+    ;;
+
+  --素材|--material)
+    t_require_admin
+    BODY="$2"; [ -n "$BODY" ] || t_die "用法：ccstatus \"$G\" --素材 \"需求文档路径 / 链接 / 人口述的描述原文\""
+    t_reject_heading "$BODY" "状态"
+    t_lock "组-$G" || t_die "该组文件被占用"
+    A="$(grep -n '^## 素材来源' "$SF" | head -1 | cut -d: -f1)"
+    B="$(awk -v h="$A" 'NR>h && /^## /{print NR; exit}' "$SF")"
+    [ -n "$B" ] || B="$(grep -n '^## 状态变更记录' "$SF" | head -1 | cut -d: -f1)"
+    TMP="$SF.tmp.$$"
+    head -n "$A" "$SF" > "$TMP"
+    printf '\n%s\n\n' "$BODY" >> "$TMP"
+    tail -n "+$B" "$SF" >> "$TMP"
+    mv "$TMP" "$SF"
+    printf -- '- %s 由 %s 登记了素材来源\n' "$(t_now)" "$(t_alias_of "$ME")" >> "$SF"
+    t_unlock "组-$G"
+    t_ok "已登记【${G}】的素材来源"
+    echo; echo "$BODY"; echo
+    echo "下一步：ccthink \"$G\" 开始逐维度深挖"
+    ;;
+
+  --产出|--output)
+    t_require_admin
+    BODY="$2"; [ -n "$BODY" ] || t_die "用法：ccstatus \"$G\" --产出 \"这个组的结论还要同步到哪些组外的文档（路径 / 说明）\""
+    t_reject_heading "$BODY" "状态"
+    t_lock "组-$G" || t_die "该组文件被占用"
+    A="$(grep -n '^## 产出去向' "$SF" | head -1 | cut -d: -f1)"
+    B="$(awk -v h="$A" 'NR>h && /^## /{print NR; exit}' "$SF")"
+    [ -n "$B" ] || B="$(grep -n '^## 状态变更记录' "$SF" | head -1 | cut -d: -f1)"
+    TMP="$SF.tmp.$$"
+    head -n "$A" "$SF" > "$TMP"
+    printf '\n%s\n\n' "$BODY" >> "$TMP"
+    tail -n "+$B" "$SF" >> "$TMP"
+    mv "$TMP" "$SF"
+    printf -- '- %s 由 %s 登记了产出去向\n' "$(t_now)" "$(t_alias_of "$ME")" >> "$SF"
+    t_unlock "组-$G"
+    t_ok "已登记【${G}】的产出去向"
+    echo; echo "$BODY"; echo
+    echo "以后每次 ccpin 改完共识，都会提醒你同步到这些地方。"
+    ;;
+
+  --就绪|--完成|--done)
+    t_require_admin
+    if [ "$MAT_OK" != 1 ]; then
+      echo "❌ 还不能置为「就绪」：素材来源没登记。" >&2
+      echo >&2
+      echo "   这个组要处理的东西是什么？原始材料在哪？——需求文档路径、链接，" >&2
+      echo "   或者人口述的描述原文，都行，但**必须有**。" >&2
+      echo >&2
+      echo "   为什么这条是前置的：深挖那一步头两个维度就是「拿需求原文逐段过」。" >&2
+      echo "   手里没有原文，那两个维度根本没法扫，只能凭空编。" >&2
+      echo "   新开的会话尤其要注意 —— 它可能压根没读过任何东西就来建组了。" >&2
+      echo >&2
+      echo "   去问人要材料（跟他说「/team material」，别让他敲 ccxxx），拿到后你执行：ccstatus \"$G\" --素材 \"...\"" >&2
+      exit 1
+    fi
+    [ "$TOPIC_OK" = 1 ] || t_die "还不能置为「就绪」：讨论内容没设置。先跑 ccstatus \"$G\" --讨论内容 \"...\""
+    if [ "$CONS_OK" != 1 ]; then
+      echo "❌ 还不能置为「就绪」：共识里没有实质内容（当前 ${CONS_LINES} 行）。" >&2
+      echo "   「就绪」的意思是【方向已经跟人谈定并记下来了，各端可以开工】。" >&2
+      echo "   共识是空的，说明方向还没落下来 —— 先跟人把方向谈清楚，用 ccpin 记进共识。" >&2
+      echo "   ⚠️ 注意：共识里该有的是【人拍板的方向】，不是 AI 自己得出的结论。" >&2
+      exit 1
+    fi
+
+    # ── 第五道门槛：深度思考扫描必须走完 ──
+    #
+    # 前面几道门槛管的是「已经写进共识的东西对不对」，管不了「该写的有没有漏」。
+    # 会话写共识的默认动作是【从会话里提取已经聊过的东西】——被动的，
+    # 会话里没人提过的一条都不会进去，哪怕它明摆着该定。
+    # ccthink 那一步是主动挖：拿维度清单一个角度一个角度问「有没有该定而没定的」。
+    THINK="$(dirname "${BASH_SOURCE[0]}")/ccthink"
+    if [ -x "$THINK" ]; then
+      if ! "$THINK" "$G" --检查 2>/tmp/.ccthink.$$; then
+        echo "❌ 还不能置为「就绪」：深度思考扫描没走完。" >&2
+        echo >&2
+        cat /tmp/.ccthink.$$ >&2
+        rm -f /tmp/.ccthink.$$
+        exit 1
+      fi
+      rm -f /tmp/.ccthink.$$
+    fi
+
+    # ── 第四道门槛：共识里不许有「未经人逐字核对」的条目 ──
+    #
+    # 光有 --人已同意 挡不住这种事：会话拿人拍板过的一个要点当由头，
+    # 把整段自己组织的分析盖上「人已同意」写进共识。人说的那几个字和
+    # 会话写的那几百字，在文件里长得一模一样，后来的人分不出来。
+    # 所以 ccpin 强制每条标「已核对 / 未核对」，这里检查：还有「未核对」的，不许就绪。
+    UNCHECKED=$(grep -c '未经人逐字核对' "$CF" 2>/dev/null | tr -d ' ')
+    [ -n "$UNCHECKED" ] || UNCHECKED=0
+    if [ "$UNCHECKED" -gt 0 ]; then
+      echo "❌ 还不能置为「就绪」：共识里还有 ${UNCHECKED} 条【没经人逐字核对】。" >&2
+      echo >&2
+      echo "   这些条目的要点人可能点过头，但那段文字是你组织的、人没有逐字看过。" >&2
+      echo "   共识是各端拿来当事实用的地基——人说的和你写的混在一起，后来的人分不出来。" >&2
+      echo >&2
+      echo "   没核对的是这几条：" >&2
+      # 认条目正文时不要写死某种前缀（原先写死了「【」，别的会话不用这个格式就认不出来）：
+      # 取该节内最近一段「不是标题、不是尾注、不是空行」的文本当条目开头。
+      # 认条目正文有三个坑，都是自测揪出来的：
+      #   ① 尾注行本身以 > 开头，判断要写在那条规则【里面】，写外面会被跳过；
+      #   ② 不能写死按「【」认条目 —— 别的会话不用这个格式就认不出来；
+      #   ③ 每个分节下面第一段是模板的占位说明（「（整体怎么搭）」这种），要跳过，
+      #      否则认出来的永远是占位文字、不是条目。
+      # 最终口径：取【上一条尾注之后的第一段的第一行】，跳过占位说明。
+      awk '/^## /{sec=$0; inpara=0; pf=""; next}
+           /^>/{ if(/未经人逐字核对/) print "     · "sec"  →  "substr(pf,1,44)"…"; inpara=0; pf=""; next }
+           /^[[:space:]]*$/{ inpara=0; next }
+           /^（/{ next }
+           { if(!inpara){ inpara=1; if(pf=="") pf=$0 } }' "$CF" >&2
+      echo >&2
+      echo "   怎么办：把每条【原样】呈给人看，人逐条表态（写入 / 改一改 / 撤掉）。" >&2
+      echo "   人认可哪条，就把那条尾部的「⚠️ 未经人逐字核对（…）」改成" >&2
+      echo "   「✅ 已与人逐条核对（这段文字人逐字过目并认可）」。" >&2
+      echo "   ⚠️ 不许打包问「这些都行吗」——打包问的结果就是「都行」，这道门等于没设。" >&2
+      exit 1
+    fi
+
+    # ── 第三道门槛：人必须显式点头，不许会话自己宣布就绪 ──
+    HUMAN_OK=0
+    for _a in "$@"; do
+      case "$_a" in --人已同意|--approved) HUMAN_OK=1 ;; esac
+    done
+    if [ "$HUMAN_OK" != 1 ]; then
+      echo "❌ 还差最后一样：人还没点头。" >&2
+      echo >&2
+      echo "   前两道门槛都过了（讨论内容已设置、共识 ${CONS_LINES} 行），但这两道是【机械检查】——" >&2
+      echo "   文件里有字就算过。你完全可以自己写讨论内容、自己 pin 满共识、再自己宣布就绪，" >&2
+      echo "   全程不问人一句。**这正是这道门要拦的事。**" >&2
+      echo >&2
+      echo "   「就绪」的含义是【各端可以进来开工了】，这是只有人能下的判断：" >&2
+      echo "     · 共识里记的方向，是不是人真的拍过板（不是另一个会话附议、不是没人反对）" >&2
+      echo "     · 够不够全，有没有还悬着没答复的问题" >&2
+      echo "     · 是不是现在就该放各端进来" >&2
+      echo "   这三样机械检查一条都答不了。" >&2
+      echo >&2
+      echo "   去问人：把共识里的条目和讨论范围摆给他，问一句【可以置为就绪、让各端进来吗】。" >&2
+      echo "   ⚠️ 跟他说话时用 /team 的形式（「/team status」看状态），别让他敲 ccxxx —— 底层命令是你执行的。" >&2
+      echo "   人点头了，重跑一次，末尾加上 --人已同意" >&2
+      exit 1
+    fi
+
+    t_set_state "就绪" "（讨论内容已设置，共识 ${CONS_LINES} 行，人已同意）"
+    t_ok "【${G}】已置为「就绪」——各端可以开工了"
+    if [ "$OUT_OK" = 1 ]; then
+      echo
+      echo "📌 别忘了同步产出：共识已定稿，下面这些组外的文档要跟着更新——"
+      printf '%s\n' "$OUT" | sed 's/^/     /'
+      echo "   （共识在讨论中还会增补，每次改完都要回来同步；文档滞后就会有人照着旧的开工。）"
+    else
+      echo
+      echo "💡 如果这个组的结论还要落到组外的文档里（协作方案、设计稿、需求包…），"
+      echo "   登记一下：ccstatus \"$G\" --产出 \"...\"　—— 以后每次改共识都会提醒你同步。"
+    fi
+    ;;
+
+  --准备中|--prep)
+    t_require_admin
+    t_set_state "准备中" "（打回：方向或讨论内容需要重新谈）"
+
+    # ⚠️ 打回时必须把「人喊停」一并作废，否则第 3 道门从此永远敞着。
+    #
+    # 出处：2026-08-16 实测。当时为了赶进度用 --人喊停 跳过了深挖、把组置了就绪，
+    # 事后打回「准备中」想重走一遍，却发现喊停记录还留着 —— 再置就绪时那道门直接放行，
+    # 等于这个组以后再也不会被深挖拦住了。
+    #
+    # 为什么该作废：喊停的意思是「针对**当前这个方向**，挖到这儿够了」。
+    # 方向都要重新谈了，那句「够了」自然跟着失效。
+    TF="${GROUPS_DIR}/${G}/深度思考.md"
+    if [ -f "$TF" ] && grep -q "^- .*记于" "$TF" 2>/dev/null; then
+      awk 'BEGIN{skip=0}
+           /^## 收尾/{print; print ""; print "（还没收尾）"; skip=1; next}
+           skip==1{next}
+           {print}' "$TF" > "${TF}.tmp" 2>/dev/null && mv "${TF}.tmp" "$TF"
+      echo "   ↺ 「人喊停」记录已作废 —— 方向要重新谈，深挖也得重走。"
+    fi
+
+    t_ok "【${G}】已打回「准备中」"
+    echo "⚠️  各端应当暂停开工，等方向重新谈定。建议用 cctell 通知全组。"
+    ;;
+
+  "")
+    echo "【${G}】讨论组状态"
+    echo
+    echo "  当前状态：${CUR}"
+    echo "  管理员：  ${ADMIN_ALIAS}$([ "$ME" = "$ADMIN" ] && echo '  ← 就是你')"
+    echo
+    echo "  讨论内容：$([ "$TOPIC_OK" = 1 ] && echo '已设置' || echo '❌ 还没设置')"
+    echo "  素材来源：$([ "$MAT_OK" = 1 ] && echo '已登记' || echo '❌ 还没登记')"
+    echo "  产出去向：$([ "$OUT_OK" = 1 ] && echo '已登记' || echo '未登记（组外没有要同步的文档就不用管）')"
+    echo "  共识内容：$([ "$CONS_OK" = 1 ] && echo "有（${CONS_LINES} 行）" || echo "❌ 太少（${CONS_LINES} 行）")"
+    _OPEN="$(awk '/^## 待人拍板/{f=1;next} /^## /{f=0} f' "$SF" | grep '^- \[ \]' || true)"
+    _DONE_N="$(awk '/^## 待人拍板/{f=1;next} /^## /{f=0} f' "$SF" | grep -c '^- \[x\]' || true)"
+    _OPEN_N="$(printf '%s' "$_OPEN" | grep -c . || true)"
+    echo "  待人拍板：挂着 ${_OPEN_N} 条，已问完 ${_DONE_N} 条"
+    echo
+    if [ "$_OPEN_N" != 0 ]; then
+      echo "───── 还挂着没问完的（认领前先扫这里）─────"
+      printf '%s\n' "$_OPEN" | sed 's/^- \[ \] /  · /'
+      echo "──────────────────────────────────────────"
+      echo
+    fi
+    if [ "$TOPIC_OK" = 1 ]; then
+      echo "───────── 讨论内容 ─────────"
+      printf '%s\n' "$TOPIC"
+      echo "────────────────────────────"
+      echo
+    fi
+    if [ "$CUR" = "准备中" ]; then
+      echo "⚠️  这个组还在「准备中」——方向还没跟人谈定，**各端不要开工**。"
+      echo
+      if [ "$ME" = "$ADMIN" ]; then
+        echo "   你是管理员，要往下走还差："
+        [ "$MAT_OK" = 1 ]   || echo "     · 登记素材来源：ccstatus \"$G\" --素材 \"需求文档在哪 / 人口述的描述\"（**这条最前置**，没它没法深挖）"
+        [ "$TOPIC_OK" = 1 ] || echo "     · 设置讨论内容：ccstatus \"$G\" --讨论内容 \"这个组要解决什么\""
+        [ "$CONS_OK" = 1 ]  || echo "     · 把人拍板的方向写进共识：ccpin \"$G\" \"...\" --人已同意"
+        echo
+        echo "   ⚠️ 别让人从零写这两样 —— 那样这道门会被跳过。正确做法："
+        echo "      ① 你从会话内容里【提取】候选：这个组要解决什么、有哪些方向性决策"
+        echo "      ② 每条标明来源：人说过的原话 / 我查到的事实 / 【我自己的判断】"
+        echo "      ③ 把「我自己的判断」那几条排最前面，逐条让人表态：写入 / 不写 / 改一改"
+        echo "      ④ 人没表态的一律不写，挂着下次再问"
+        [ "$TOPIC_OK" = 1 ] && [ "$CONS_OK" = 1 ] && echo "     · 前两道门槛够了，还差【问人点头】，然后：ccstatus \"$G\" --就绪 --人已同意"
+      else
+        echo "   要推进请找管理员（${ADMIN_ALIAS}），你改不了状态。"
+      fi
+    else
+      echo "✅ 准备就绪，可以开工。"
+    fi
+    exit 0
+    ;;
+
+  *)
+    t_die "不认识的参数：$1（可用：--讨论内容 \"...\" / --就绪 / --准备中）"
+    ;;
+esac

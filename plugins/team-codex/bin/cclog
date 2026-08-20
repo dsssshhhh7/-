@@ -1,0 +1,24 @@
+#!/bin/bash
+# cclog —— 看某个组的完整传话流水（追溯用）
+#   cclog <组名>            最近 20 条
+#   cclog <组名> --全部      全部
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+G="$1"
+[ -n "$G" ] || t_die "用法：cclog <组名>"
+t_group_exists "$G" || t_die "没有这个组：$G"
+
+LIMIT=20
+{ [ "$2" = "--全部" ] || [ "$2" = "--all" ]; } && LIMIT=99999
+
+echo "【${G}】传话流水"
+echo
+head -6 "$(t_group_log "$G")" | tail -2
+awk 'NR>6' "$(t_group_log "$G")" | tail -"$LIMIT"
+echo
+total=$(awk 'NR>6 && /^\|/' "$(t_group_log "$G")" | wc -l | tr -d ' ')
+echo "共 ${total} 条。"
+echo
+echo "流水回答的是「怎么变成现在这样的」；"
+echo "想知道「现在的约定是什么」，看共识：cccatch \"${G}\""

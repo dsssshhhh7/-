@@ -1,0 +1,86 @@
+#!/bin/bash
+# ccinbox —— 手动看收件箱里还有什么没处理
+#
+#   ccinbox              列出所有未处理的
+#   ccinbox <组名>       只看某个组的
+#   ccinbox --全文       连正文一起打出来
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+t_ensure_mydir
+
+FILTER=""; FULL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --全文|--full) FULL=1; shift ;;
+    *)             FILTER="$1"; shift ;;
+  esac
+done
+
+_field() { sed -n "s/^$1: //p" "$2" 2>/dev/null | head -1; }
+
+# 排序：**传话台（投递）排最前** —— 那边有个人在等着回话；
+# 其次传话台（回复），最后讨论组的。同一档内按文件名（也就是时间）排。
+_sort_key() {   # 消息文件 → 排序前缀
+  case "$(_field 类型 "$1")" in
+    传话台投递) printf '1' ;;
+    传话台回复) printf '2' ;;
+    *)          printf '3' ;;
+  esac
+}
+files="$(
+  find "$(t_myinbox)" -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort | while IFS= read -r f; do
+    [ -n "$f" ] && printf '%s\t%s\n' "$(_sort_key "$f")" "$f"
+  done | sort -k1,1 | cut -f2-
+)"
+if [ -z "$files" ]; then
+  echo "收件箱是空的 —— 没有待处理的消息。"
+  echo "（处理完的消息会被删掉，内容在各组的传话记录里留着，所以这里永远只有待办。）"
+  exit 0
+fi
+
+n=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  g="$(_field 组 "$f")"
+  [ -n "$FILTER" ] && [ "$g" != "$FILTER" ] && continue
+  n=$((n + 1))
+
+  from="$(_field 来自 "$f")"
+  tm="$(_field 时间 "$f")"
+  urgent="$(_field 紧急 "$f")"
+  depth="$(_field 接力深度 "$f")"
+  kind="$(_field 类型 "$f")"
+
+  tag="📬"
+  [ "$urgent" = "是" ]  && tag="🚨"
+  [ "$kind" = "系统" ]  && tag="🔔"
+  case "$f" in *已退出仅供参考*) tag="🚪" ;; esac
+
+  # 传话台的消息单独标出来：它跟讨论组消息的处理方式完全不同
+  # （投递要原样呈给人、可回一条；回复只呈给人、不许再回）
+  label=""
+  case "$kind" in
+    传话台投递) tag="📨"; label="  ⟨传话·投递，原样呈给人，可回一条⟩" ;;
+    传话台回复) tag="📩"; label="  ⟨传话·回复，呈给人即可，不许再回⟩" ;;
+  esac
+
+  echo
+  echo "${tag} [${n}] 组=${g}  来自=${from}  ${tm}  深度=${depth}${label}"
+  echo "     文件: ${f}"
+  if [ "$FULL" -eq 1 ]; then
+    echo "     ─────"
+    sed -n '/^---$/,/^---$/!p' "$f" | grep -v '^$' | sed 's/^/     /'
+  else
+    body="$(sed -n '/^---$/,/^---$/!p' "$f" | grep -v '^$' | head -2)"
+    printf '     %s\n' "$body"
+  fi
+done <<< "$files"
+
+echo
+if [ "$n" -eq 0 ]; then
+  echo "没有属于【${FILTER}】的未处理消息。"
+else
+  echo "共 ${n} 条待处理。"
+  echo "处理完记得：① 标已处理（ccack --处理 <组> <消息号>）② 删掉消息文件"
+fi

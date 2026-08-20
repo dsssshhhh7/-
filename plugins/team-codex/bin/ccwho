@@ -1,0 +1,38 @@
+#!/bin/bash
+# ccwho <组名> —— 这个组有谁，各自在线还是关了
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+t_ensure_skeleton
+G="$1"
+# 不带组名 = 想看「谁在线」，那是地址簿的活（传话台没有成员的概念，
+# 能不能发给一个窗口只取决于它登记过代号、且收件程序在岗）
+if [ -z "$G" ]; then
+  exec "$(dirname "${BASH_SOURCE[0]}")/ccbook"
+fi
+t_group_exists "$G" || t_die "没有这个组：$G    （跑 ccgroups 看现有的）"
+
+ME="$(t_sid)"
+echo "【${G}】组内成员："
+echo
+
+t_members_of "$G" | while IFS= read -r id; do
+  [ -z "$id" ] && continue
+  name="$(t_display "$id")"
+  st="$(t_status_of "$id")"
+  role="$(t_member_role "$G" "$id")"
+
+  # 未读消息数（只有这个成员自己的信箱能看到，但都在本机所以能查）
+  inbox="$SESSIONS_DIR/$id/收件箱"
+  unread=0
+  [ -d "$inbox" ] && unread=$(find "$inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+
+  me=""; [ "$id" = "$ME" ] && me="  ← 我"
+  extra=""
+  [ "$unread" -gt 0 ] && extra="   有 $unread 条未读"
+
+  printf '  %s %s %s%s%s\n' "$(t_pad "$name" 16)" "$(t_pad "$st" 10)" "${role:-未填职责}" "$extra" "$me"
+done
+
+echo
+n="$(t_members_of "$G" | wc -l | tr -d ' ')"
+echo "共 $n 人。"

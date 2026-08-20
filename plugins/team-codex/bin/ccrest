@@ -1,0 +1,26 @@
+#!/bin/bash
+# ccrest —— 让加工员立刻下班，不等那 1 小时
+# 这一轮协作结束、要转去做别的事时用，省下空等的钱。
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "Codex 没有常驻加工员需要下班。"
+  exit 0
+fi
+t_ensure_skeleton
+
+AGENT_FILE="$(t_mydir)/.agent"
+if [ ! -f "$AGENT_FILE" ]; then
+  echo "加工员本来就不在岗，没有在烧钱。"
+  exit 0
+fi
+
+started="$(head -1 "$AGENT_FILE" 2>/dev/null || echo 0)"
+mins=$(( ( $(t_epoch) - started ) / 60 ))
+rm -f "$AGENT_FILE"
+
+t_ok "加工员已下班（本次在岗 ${mins} 分钟）"
+echo
+echo "收件程序仍在岗（不花钱），消息照常自动送达，只是不再分级和过滤。"
+echo
+echo "⚠️  会话请把那个正在跑的加工员真正结束掉，光删标记它还在后台续命烧钱。"

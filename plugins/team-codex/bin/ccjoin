@@ -1,0 +1,272 @@
+#!/bin/bash
+# ccjoin —— 加入讨论组
+#
+# 用法：
+#   ccjoin                              列出现有组让你选（推荐，不会打错字）
+#   ccjoin <组名>                       加入；组不存在时先做相似检查
+#   ccjoin <组名> --新建                跳过相似检查，直接建新组
+#   ccjoin <组名> --代号 <代号>         首次加入时指定自己的代号
+#   ccjoin <组名> --负责 "安卓端字段改造"  说明自己在组内负责什么
+#
+# 注意：本脚本只做不需要判断的部分。起「收件程序」必须由会话来做，
+#       脚本起不了那个能把消息推进会话的盯梢。顺序见 SKILL.md。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+t_ensure_mydir
+
+ME="$(t_sid)"
+G=""; NEW=0; WANT_ALIAS=""; ROLE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --新建|--new)   NEW=1; shift ;;
+    --代号|--alias) WANT_ALIAS="$2"; shift 2 ;;
+    --负责|--role)  ROLE="$2"; shift 2 ;;
+    -*)             t_die "不认识的参数：$1" ;;
+    *)              G="$1"; shift ;;
+  esac
+done
+
+# ── 没给组名：列出来让选 ──
+if [ -z "$G" ]; then
+  "$(dirname "${BASH_SOURCE[0]}")/ccgroups"
+  echo
+  echo "选好之后执行：ccjoin <组名>"
+  exit 0
+fi
+
+t_check_groupname "$G"
+
+# ── 组不存在：相似检查，防止打错字分裂成两个组 ──
+if ! t_group_exists "$G"; then
+  if [ "$NEW" -eq 0 ]; then
+    # 去掉常见分隔符后互相包含，就算相似
+    key="$(printf '%s' "$G" | tr -d ' -_－—')"
+    similar=""
+    while IFS= read -r e; do
+      [ -z "$e" ] && continue
+      ekey="$(printf '%s' "$e" | tr -d ' -_－—')"
+      case "$ekey" in *"$key"*) similar="$similar$e"$'\n' ;; esac
+      case "$key" in *"$ekey"*) similar="$similar$e"$'\n' ;; esac
+    done <<< "$(t_all_groups)"
+    similar="$(printf '%s' "$similar" | sort -u | grep -v '^$')"
+
+    if [ -n "$similar" ]; then
+      echo "⚠️  没有【${G}】这个组，但有名字相近的："
+      echo
+      while IFS= read -r s; do
+        [ -z "$s" ] && continue
+        printf '    %s（%s 人）\n' "$s" "$(t_members_of "$s" | wc -l | tr -d ' ')"
+      done <<< "$similar"
+      echo
+      echo "你是想加入上面某一个？那就用它的完整名字重新执行。"
+      echo "确实要新建一个叫【${G}】的组，加参数：ccjoin \"$G\" --新建"
+      exit 1
+    fi
+    echo "没有【${G}】这个组，也没有名字相近的。"
+    echo "确认要新建就加参数：ccjoin \"$G\" --新建"
+    exit 1
+  fi
+  t_group_init "$G"
+  CREATED=1
+  # 组一建出来就是「准备中」，并且当场把状态文件写死 ——
+  # 不能等 ccstatus 第一次跑才创建：那之间的窗口里别人能长驱直入，
+  # 而「准备中不许别人进」这条拦截恰恰是靠这个文件生效的。
+  {
+    printf '# 讨论组状态 · %s\n\n' "$G"
+    printf -- '- **当前状态**：准备中\n'
+    printf -- '- **管理员**：%s\n\n' "$ME"
+    printf '## 讨论内容（只有管理员能设置）\n\n（还没设置）\n\n'
+    printf '## 状态变更记录\n\n- %s 建组，初始「准备中」\n' "$(t_now)"
+  } > "$(t_group_dir "$G")/状态.md"
+fi
+
+# ── 组还在「准备中」时，除管理员外不许进 ──
+#
+# 为什么这条是硬拦截：真实事故里，一个成员在方向还没跟人谈定时就进了组，
+# 四分钟后看到一份写着「已谈定」的共识 —— 它没有任何机会反对那条地基，
+# 因为它进来时那条已经在文件里了。等人发现方向是反的，已经过了一个半小时。
+#
+# 所以：方向没跟人谈定之前，别让人进来。进来就等于默认接受了里面的东西。
+if [ "${CREATED:-0}" -ne 1 ]; then
+  GDIR="$(t_group_dir "$G")"
+  SF="$GDIR/状态.md"
+  if [ -f "$SF" ]; then
+    GSTATE="$(grep -E '^- \*\*当前状态\*\*：' "$SF" | head -1 | sed 's/.*：//' | tr -d ' ')"
+    GADMIN="$(grep -E '^- \*\*管理员\*\*：' "$SF" | head -1 | sed 's/.*：//' | tr -d ' ')"
+    if [ "$GSTATE" = "准备中" ] && [ "$ME" != "$GADMIN" ] && ! t_is_member "$G" "$ME"; then
+      ADMIN_ALIAS="$(t_alias_of "$GADMIN")"; [ -n "$ADMIN_ALIAS" ] || ADMIN_ALIAS="$GADMIN"
+      echo "🚫 【${G}】还在「准备中」，现在不能加入。" >&2
+      echo >&2
+      echo "   意思是：这个组要讨论什么、方向是什么，管理员还没跟人谈定。" >&2
+      echo "   这时候进来，你会把一份还没定的东西当成已定的地基 —— 而且你没机会反对，" >&2
+      echo "   因为它在你进来之前就已经写在文件里了。" >&2
+      echo >&2
+      echo "   管理员是【${ADMIN_ALIAS}】，等它把方向跟人谈定、把组置为「就绪」，你再来。" >&2
+      echo "   看当前进度：ccstatus \"$G\"" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# ── 确定我的代号 ──
+ALIAS="$(t_alias_of "$ME")"
+if [ -n "$WANT_ALIAS" ]; then
+  ALIAS="$WANT_ALIAS"
+fi
+
+if [ -z "$ALIAS" ]; then
+  # 没收编过又没指定 → 猜一个建议值，让会话拿去问你
+  base="$(basename "$(t_cwd_of "$ME")" 2>/dev/null)"
+  [ -z "$base" ] || [ "$base" = "/" ] && base="$(basename "$PWD")"
+  guess="${base}-$(printf '%s' "$ME" | cut -c1-4)"
+  echo "你还没有代号。代号是你在协作里的称呼，编号太长记不住。"
+  echo
+  echo "建议：$guess"
+  echo "（看目录名猜的，你可以起个更好懂的，比如 安卓-外勤、后端-外勤）"
+  echo
+  echo "定好后执行：ccjoin \"$G\" --代号 <你的代号> --负责 \"<你在组内干什么>\""
+  exit 2
+fi
+
+# ── 代号查重 ──
+owner="$(t_alias_taken_by_other "$ALIAS" "$ME")"
+if [ -n "$owner" ]; then
+  # 占用者已经关掉时要单独说 —— 名字是被一条【死记录】占着的，
+  # 说成「已被占用」会让人以为有个活窗口在用，然后一头撞死在这儿
+  if [ "$(t_status_of "$owner")" = "已关闭" ]; then
+    echo "❌ 代号【${ALIAS}】被一个**已经关掉的**窗口占着（编号 ${owner}）。" >&2
+    echo "   还想接着那个窗口干 → ccresume \"${ALIAS}\" 把它找回来；" >&2
+    echo "   只是想要这个名字 → 换一个（${ALIAS}2、${ALIAS}-新）。" >&2
+    exit 1
+  fi
+  t_die "代号【${ALIAS}】已被另一个会话占用（${owner}）。换一个再来。"
+fi
+
+# ── 写入（加锁，防多个会话同时改）──
+t_lock 索引 || t_die "索引被占用，稍后重试"
+groups_now="$(t_groups_of "$ME")"
+[ "$groups_now" = "-" ] && groups_now=""
+if printf '%s' "$groups_now" | tr ',' '\n' | grep -qxF "$G"; then
+  ALREADY=1
+else
+  ALREADY=0
+  if [ -z "$groups_now" ]; then groups_now="$G"; else groups_now="$groups_now,$G"; fi
+fi
+t_index_upsert "$ME" "$ALIAS" "$groups_now"
+t_unlock 索引
+
+# 流水登记用的消息号，必须跟下面发出去的通知消息是同一个 ——
+# 不一致的话收件方的收件程序拿着通知里的号去流水里找行，找不到，回执永远标不上。
+NOTIFY_MID="$(t_msgid)"
+
+if [ "$ALREADY" -eq 0 ]; then
+  t_lock "组-$G" || t_die "该组文件被占用，稍后重试"
+  printf '| %s | %s | %s |\n' "$ME" "${ROLE:-未填}" "$(t_now)" >> "$(t_group_members "$G")"
+  t_log_append "$G" "$NOTIFY_MID" "$ALIAS" "全组" "加入本组（${ROLE:-未填职责}）" ""
+  t_unlock "组-$G"
+fi
+
+# ── 写名片 ──
+# 职责：这次没传就沿用名片里已有的，别用空值把它冲掉 ——
+# 同一个会话加入第二个组时通常不会再传一遍 --负责，覆盖了就白填了。
+CARD="$(t_mydir)/名片.md"
+KEEP_ROLE="$ROLE"
+if [ -z "$KEEP_ROLE" ] && [ -f "$CARD" ]; then
+  OLD_ROLE="$(grep '^职责：' "$CARD" 2>/dev/null | sed 's/^职责：//')"
+  case "$OLD_ROLE" in
+    "（未填"*|"") ;;                 # 占位符不算，当成没填
+    *) KEEP_ROLE="$OLD_ROLE" ;;
+  esac
+fi
+
+cat > "$CARD" <<EOF
+# 名片
+
+代号：$ALIAS
+编号：$ME
+目录：$(t_cwd_of "$ME")
+职责：${KEEP_ROLE:-（未填，建议补上——加工员靠这个判断消息跟你有没有关系）}
+
+## 当前加入的协作
+$(printf '%s' "$groups_now" | tr ',' '\n' | sed 's/^/- /' | grep -v '^- $')
+
+> 这份名片是「当前状态」的权威记录。
+> 你关窗口期间组里可能变了，恢复回来读一眼这里和各组共识来对账。
+EOF
+
+# ── 通知组里其他人 ──
+notified=0
+# 注意：NOTIFY_MID 在上面写流水时就已经生成了，这里绝对不能再生成一个新的 ——
+# 那样流水里的号和通知里的号又对不上，回执还是标不了。
+while IFS= read -r mid; do
+  [ -z "$mid" ] || [ "$mid" = "$ME" ] && continue
+  t_deliver "$mid" "$G" "$ALIAS" "$ME" \
+    "【${ALIAS}】加入了本组，负责：${ROLE:-未填}。" 0 否 系统 "$NOTIFY_MID" >/dev/null
+  notified=$((notified + 1))
+done <<< "$(t_members_of "$G")"
+
+# ── 输出 ──
+echo
+if [ "${CREATED:-0}" -eq 1 ]; then
+  t_ok "已创建讨论组【${G}】，你是第 1 位成员，代号【${ALIAS}】。"
+  echo
+  echo "要拉其他会话进来，去它们的窗口敲："
+  echo "    ccjoin \"$G\" --代号 <它的代号> --负责 \"<它干什么>\""
+  echo "或者在那边直接敲 ccjoin 从列表里选（不会打错字）。"
+  echo
+  echo "注意：拉人这一步必须你手动做。没加入协作的会话不跑任何后台程序，"
+  echo "      所以它收不到邀请 —— 让一个会话自动被拉进来、开始改文件，本来也该你点头。"
+elif [ "$ALREADY" -eq 1 ]; then
+  t_ok "你已经在【${G}】里了（代号 ${ALIAS}），没有重复加入。"
+else
+  t_ok "已加入【${G}】，代号【${ALIAS}】，已通知组内其他 $notified 人。"
+fi
+
+echo
+echo "═════════ 进组必读 · 关于「问人」这件事 ═════════"
+echo
+echo "  ⚠️ 【组里所有成员的「我窗口的人」，是同一个人。】"
+echo
+echo "  每个会话开的是各自的对话窗口，但坐在那些窗口前面的**是同一个人**。"
+echo
+echo "  所以「我去问我窗口的人」**不是零成本动作**："
+echo "    · 你问一次，是那个人被打扰一次"
+echo "    · 四个端各问一次，是同一个人被同一件事问了四次 ——"
+echo "      而每个端都以为自己只问了一次"
+echo
+echo "  **实测后果**（同一天、同一个组）："
+echo "    · 两个端就同一个视觉细节各自认领去问，两人还各自在组里说了「我去问、你别问」"
+echo "    · 两个端就同一个功能各问一次，**拿回两个不同的答案** —— 不是人改主意，"
+echo "      是两次给他的选项不一样：各人只列得出自己看得见的那部分代价，"
+echo "      **看不见的那部分就成了选项里缺的那一项**"
+echo
+echo "  ✅ 所以问之前要做三件事，一件都不能省："
+echo "    ① 在组里说一句「这条我去问」"
+echo "    ② **先看一眼有没有人已经问过同一件事** —— 光说不看，两个人会同时认领"
+echo "    ③ **这件事跨了两个以上的端吗？** 跨了就别自己问："
+echo "       先在组里把各端的代价凑齐，由其中一人合成一次问完。"
+echo "       否则先问的那个人，等于替所有人删掉了一部分选项。"
+echo
+echo "  ✅ 问完之后立刻广播两件事：**结论是什么、写进了共识的哪一节**。"
+echo "     只广播结论不说写在哪，别人做整体核对时会再写一遍，共识里就出现两份全文。"
+echo
+echo "═════════════════════════════════════════════════"
+echo
+echo "───────── 补课：本组当前共识 ─────────"
+cat "$(t_group_consensus "$G")"
+echo "──────────────────────────────────────"
+echo
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "Codex 原生任务消息通道已启用；其他成员可直接唤醒本任务。"
+elif t_watcher_running; then
+  echo "收件程序已在岗，新组的消息会自动进来。"
+else
+  echo "⚠️  收件程序还没起 —— 现在起它，否则这个会话收不到任何消息。"
+  echo "    这一步脚本做不了，必须由会话用盯梢工具启动（见 SKILL.md「起收件程序」）。"
+  echo
+  echo "    ❗️如果你是【人】在终端直接敲的这条命令：组是进了，但消息收不到。"
+  echo "      请在会话里改敲  /team join <组名>  —— 那样会话才会读到守则、"
+  echo "      知道要起收件程序，也才会做加入之后该做的其余几步。"
+fi

@@ -1,0 +1,161 @@
+#!/bin/bash
+# ccclose —— 结案：需求做完上线了，这个协作正式结束
+#
+#   ccclose <组名>              第一步：检查 + 摆出素材，交给会话提炼结案文档
+#   ccclose <组名> --完成        第二步：文档写好之后，真正遣散并删掉组文件夹
+#
+# 结案 ≠ 所有人退出。人走光了组还在、别人还能加进来；
+# 结案是「这件事做完了」，组文件夹删掉，只留一份结案文档。
+#
+# 结案是在做减法：3 个零碎文件 → 合成 1 个。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+G="$1"
+[ -n "$G" ] || t_die "用法：ccclose <组名>"
+t_group_exists "$G" || t_die "没有这个组：$G"
+DOC="$CLOSED_DIR/${G}-结案.md"
+
+# ═══════ 第二步：真正执行 ═══════
+if [ "$2" = "--完成" ] || [ "$2" = "--done" ]; then
+  [ -f "$DOC" ] || t_die "结案文档还没写：$DOC
+先跑 ccclose \"$G\"（不带 --完成）拿素材，让会话提炼出文档再来。"
+  [ "$(wc -l < "$DOC" | tr -d ' ')" -ge 10 ] || t_die "结案文档太短（不到 10 行），八成没写完。"
+
+  ME="$(t_sid)"; ALIAS="$(t_alias_of "$ME")"
+  MID="$(t_msgid)"
+
+  # 通知所有成员（自己就不用通知了 —— 结案是自己发起的，还给自己发一条纯属噪音）
+  while IFS= read -r m; do
+    [ -z "$m" ] || [ "$m" = "$ME" ] && continue
+    t_deliver "$m" "$G" "${ALIAS:-系统}" "$ME" \
+      "【${G}】已结案。结案文档：${DOC}
+本组文件夹即将删除，后续不再收发本组消息。" 0 否 系统 "$MID" >/dev/null
+  done <<< "$(t_members_of "$G")"
+
+  # 把这个组从所有成员的索引条目里摘掉
+  t_lock 索引 || t_die "索引被占用"
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    # 结案后就算一个组都不剩，也**只清空组籍、留着代号** ——
+    # 代号是那个窗口的身份，不该被别人的结案动作抹掉（跟 ccleave --all 同一个口径）
+    gs="$(t_groups_of "$m" | tr ',' '\n' | grep -vxF "$G" | tr '\n' ',' | sed 's/,$//')"
+    t_index_upsert "$m" "$(t_alias_of "$m")" "$gs"
+  done <<< "$(t_members_of "$G")"
+  t_unlock 索引
+
+  rm -rf "$(t_group_dir "$G")"
+
+  t_ok "【${G}】已结案"
+  echo
+  echo "  结案文档：$DOC"
+  echo "  组文件夹已删除，成员已遣散。"
+  echo
+  # ⚠️ 这里以前写的是「还要停掉收件程序和加工员」—— 收件程序**不能停**：
+  #    结案只是没组了，各人的代号都还在，还都接在传话台上；停了就再也收不到别人
+  #    传的话，还会在别人地址簿里显示离线。该停的只有加工员（它花钱）。
+  #    同样的错在 ccleave 里修过一次，这处当时漏了。
+  if [ "${TEAM_RUNTIME}" = "codex" ]; then
+    echo "  各任务的代号继续保留，仍可通过 Codex 原生消息使用传话台。"
+    echo "  Codex 版没有 watcher 或常驻加工员需要清理；彻底退出是 ccname --注销。"
+  else
+    echo "  各人的收件程序**继续留着** —— 组没了，代号还在，大家还接在传话台上。"
+    echo "  该停的只有加工员（如果起过，它花钱）。彻底退出协作是 ccname --注销。"
+  fi
+  echo "  想复活：ccreopen \"$DOC\""
+  exit 0
+fi
+
+# ═══════ 第一步：检查 + 摆素材 ═══════
+echo "═══ 结案前检查：【${G}】 ═══"
+echo
+warn=0
+while IFS= read -r m; do
+  [ -z "$m" ] && continue
+  st="$(t_status_of "$m")"
+  inbox="$SESSIONS_DIR/$m/收件箱"
+  unread=0
+  [ -d "$inbox" ] && unread=$(find "$inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+  flag=""
+  [ "$st" = "在线忙碌" ] && { flag="  ⚠️ 正在忙"; warn=1; }
+  [ "$unread" -gt 0 ] && { flag="${flag}  ⚠️ 还有 ${unread} 条未读"; warn=1; }
+  printf '  %s %s %s%s\n' "$(t_pad "$(t_display "$m")" 16)" "$(t_pad "$st" 10)" "$(t_member_role "$G" "$m")" "$flag"
+done <<< "$(t_members_of "$G")"
+
+echo
+[ "$warn" -eq 1 ] && echo "⚠️  有人在忙或有未读消息 —— 确认这些都不重要了再结案。" && echo
+
+# ── 结案前最后一道：人拍板过、却没进共识的，现在不捞就永远没了 ──
+#
+# 共识的规矩一直是单向的：只防「写进不该写的」，从不防「该写的没写」。
+# 而漏写的后果正好是这套东西存在的理由 —— 结案文档是从共识长出来的，
+# 共识里没有的东西，结案文档里也不会有，下一个做类似需求的人就再也见不到了。
+#
+# 这里查两样都是白纸黑字、不用猜的：
+#   · 「待人拍板」里还挂着没问完的 —— 那是明说了要问人、结果没问
+#   · 标了「问完」却没记写进哪一节的 —— 问了、人定了，然后掉在地上
+_SFC="$(t_group_dir "$G")/状态.md"
+if [ -f "$_SFC" ]; then
+  _OPEN="$(awk '/^## 待人拍板/{f=1;next} /^## /{f=0} f' "$_SFC" | grep '^- \[ \]' || true)"
+  _DONE_NOSEC="$(awk '/^## 待人拍板/{f=1;next} /^## /{f=0} f' "$_SFC" | grep '^- \[x\]' | grep -v '结论写进：' || true)"
+  if [ -n "$_OPEN" ] || [ -n "$_DONE_NOSEC" ]; then
+    echo "🚨 结案前先看这个：有该进共识却没进的"
+    echo
+    if [ -n "$_OPEN" ]; then
+      echo "  ── 说了要问人、但一直没问完 ──"
+      printf '%s\n' "$_OPEN" | sed 's/^- \[ \] /     · /'
+      echo "     要么现在去问人、问完 ccstatus \"$G\" --已问 \"…\" --写进 <哪一节>；"
+      echo "     要么确认这件事已经不重要了：ccstatus \"$G\" --撤销认领 \"…\""
+      echo
+    fi
+    if [ -n "$_DONE_NOSEC" ]; then
+      echo "  ── 问完了、人也定了，却没记写进共识哪一节 ──"
+      printf '%s\n' "$_DONE_NOSEC" | sed 's/^- \[x\] /     · /'
+      echo "     人拍板过的结论必须进共识。先 ccpin 写进去，再回来结案。"
+      echo
+    fi
+    echo "  为什么卡在这一步说：结案文档是从共识长出来的。共识里没有的东西，"
+    echo "  结案文档里也不会有 —— 下一个做类似需求的人就再也见不到了。"
+    echo
+    echo "  ⚠️ 另外，共识之外还有一类漏网：结论是在几条来回中慢慢形成的，"
+    echo "     没有哪一条单独说「就这么定了」。那种只能靠回捞：ccsum \"$G\""
+    echo
+    echo "═══════════════════════════════════════"
+    echo
+  fi
+fi
+
+first="$(awk 'NR>6 && /^\|/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' FS='|' "$(t_group_log "$G")")"
+total=$(awk 'NR>6 && /^\|/' "$(t_group_log "$G")" | wc -l | tr -d ' ')
+members=$(t_members_of "$G" | wc -l | tr -d ' ')
+
+echo "═══ 素材 ═══"
+echo
+echo "起止：${first:-未知} ~ $(t_now)   参与：${members} 人   往来：${total} 条"
+echo
+echo "──────── 共识全文（原样保留进结案文档）────────"
+cat "$(t_group_consensus "$G")"
+echo
+echo "──────── 全部传话流水（用来提炼时间线和各端差异）────────"
+awk 'NR>4' "$(t_group_log "$G")"
+echo
+echo "═══ 会话请做这件事 ═══"
+echo
+echo "把结案文档写到：$DOC"
+echo
+echo "结构照这个来（后两块要你从流水里【提炼】，不是照抄）："
+echo
+echo "  # ${G} · 结案"
+echo "  起止：… 参与：… 往来：… 条"
+echo
+echo "  ## 最终约定"
+echo "  （共识全文，原样搬过来）"
+echo
+echo "  ## 关键决策时间线"
+echo "  （从流水里挑出真正改变了约定的那几条，按时间排。闲聊和确认不要）"
+echo
+echo "  ## 各端差异（下次做类似需求必看）"
+echo "  （某端提过的限制、踩过的坑。这些不在任何一端的代码里，是最难重新获得的东西）"
+echo
+echo "写完执行：ccclose \"$G\" --完成"

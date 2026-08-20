@@ -1,0 +1,313 @@
+#!/bin/bash
+# ccdoctor —— 体检：装对了吗、跑得起来吗、哪里不对怎么修
+#
+# 这是唯一一条【在 Claude Code 会话外也能跑】的命令 —— 它的活就是诊断
+# "为什么跑不起来"，要是它自己也要求在会话里，那就没用了。
+
+TEAM_SKIP_SESSION_CHECK=1
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+# Codex 版不依赖 claude CLI、watcher 或 claude-hud。这里先走专用体检，
+# 避免沿用的 Claude 诊断把“没装 Claude”误报成故障。
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  PASS=0; WARN=0; FAIL=0
+  ok()   { printf '  ✅ %s\n' "$*"; PASS=$((PASS+1)); }
+  warn() { printf '  ⚠️  %s\n' "$*"; WARN=$((WARN+1)); }
+  bad()  { printf '  ❌ %s\n' "$*"; FAIL=$((FAIL+1)); }
+
+  echo "Codex team 协作体检"
+  echo
+  [ -n "${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" ] && ok "Codex 任务编号可用" || bad "拿不到 CODEX_THREAD_ID"
+  command -v bash >/dev/null 2>&1 && ok "bash 可用" || bad "缺少 bash（Windows 请安装 Git for Windows）"
+  command -v jq >/dev/null 2>&1 && ok "jq 可用（可选）" || warn "未安装 jq；Codex 核心收发不依赖它"
+  t_ensure_skeleton
+  [ -d "$TEAM_ROOT" ] && [ -w "$TEAM_ROOT" ] && ok "数据目录可写：$TEAM_ROOT" || bad "数据目录不可写：$TEAM_ROOT"
+  [ -f "$SKILL_DIR/.codex-plugin/plugin.json" ] && ok "Codex 插件清单存在" || bad "缺少 .codex-plugin/plugin.json"
+  [ -f "$SKILL_DIR/skills/team/SKILL.md" ] && ok "team Skill 存在" || bad "缺少 skills/team/SKILL.md"
+  [ -x "$SKILL_DIR/bin/cctell" ] || [ -f "$SKILL_DIR/bin/cctell" ] && ok "账本命令齐全" || bad "缺少 bin/cctell"
+  echo
+  printf '结果：%s 项通过，%s 项提醒，%s 项失败。\n' "$PASS" "$WARN" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
+PASS=0; WARN=0; FAIL=0
+ok()   { printf '  ✅ %s\n' "$*"; PASS=$((PASS+1)); }
+warn() { printf '  ⚠️  %s\n' "$*"; WARN=$((WARN+1)); }
+bad()  { printf '  ❌ %s\n' "$*"; FAIL=$((FAIL+1)); }
+fix()  { printf '       → %s\n' "$*"; }
+
+echo "════════ 多会话协作 · 体检 ════════"
+echo
+
+# ───────── 一、能不能跑 ─────────
+echo "【一、基础环境】"
+
+case "$(uname -s)" in
+  Darwin)
+    ok "系统：macOS $(sw_vers -productVersion 2>/dev/null)" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    ok "系统：Windows（$(uname -s)），跑在 Git Bash 里 —— 已实测支持"
+    # 这台机器上是不是有个坏的 git 排在前面（真出过：被「软件搬家」挪到别的盘那种）
+    if command -v git >/dev/null 2>&1; then
+      ok "git（$(git --version 2>/dev/null)）"
+    else
+      bad "找不到 git —— 加市场/更新都要用它"
+      fix "装 Git for Windows，或把 C:\\Program Files\\Git\\cmd 加进 PATH"
+    fi ;;
+  Linux)
+    warn "系统：Linux —— 本机制在 macOS 与 Windows 上实测过，Linux 未验证"
+    ok "跨系统差异已在 lib.sh 里统一（t_mtime / t_fmt_epoch / t_sed_inplace / t_watcher_pids）" ;;
+  *)
+    bad "系统：$(uname -s) —— 没在这个系统上验证过" ;;
+esac
+
+BV="$(bash --version 2>/dev/null | head -1 | sed 's/.*version \([0-9.]*\).*/\1/')"
+case "$BV" in
+  3.*) warn "bash 版本 ${BV}（macOS 自带的老版本，2007 年）"
+       fix "本机制已针对它做过适配，能用。但如果你改代码，所有变量都要写成 \${变量} 形式" ;;
+  "")  bad "查不到 bash 版本" ;;
+  *)   ok "bash 版本 $BV" ;;
+esac
+
+case "${LANG}${LC_ALL}" in
+  *UTF-8*|*utf8*) ok "语言环境 ${LANG:-$LC_ALL}（中文按字数算，正确）" ;;
+  "") warn "语言环境没设置"
+      fix "中文可能按字节算，导致截断出现乱码。建议在 shell 配置里加 export LANG=zh_CN.UTF-8" ;;
+  *)  warn "语言环境 ${LANG:-$LC_ALL} 不是 UTF-8"
+      fix "中文会按字节算，截断时可能切出乱码" ;;
+esac
+echo
+
+# ───────── 二、依赖的命令 ─────────
+echo "【二、依赖的命令】"
+for c in find awk sed grep; do
+  command -v "$c" >/dev/null 2>&1 && ok "$c" || bad "$c 找不到 —— 这是系统基础命令，缺了说明环境有问题"
+done
+
+# pgrep 不是必需的：Windows 的 Git Bash 没有它，那边退回翻进程列表（见 lib.sh 的 t_watcher_pids）
+if command -v pgrep >/dev/null 2>&1; then
+  ok "pgrep"
+else
+  ok "pgrep 没有（Windows 正常现象，已自动退回用 ps 翻进程列表）"
+fi
+
+if command -v jq >/dev/null 2>&1; then
+  ok "jq（用来解析在线状态）"
+else
+  bad "jq 找不到 —— 查不了谁在线"
+  fix "装它：brew install jq        （Linux：apt install jq 或 yum install jq）"
+fi
+
+if command -v claude >/dev/null 2>&1; then
+  ok "claude（$(command -v claude)）"
+  # 有的 claude 版本没有 agents --json。不算故障：谁在不在线看的是心跳，不看它。
+  if [ -f "${TEAM_ROOT}/.plugin/no-agents-json" ]; then
+    warn "这个 claude 不支持 agents --json —— 「系统名 / 工作目录」这类附带信息查不到"
+    fix "不影响用：在线判断走心跳。已记下来，不会每条命令都去试一次。"
+    fix "升级 claude 之后想重新试：rm \"${TEAM_ROOT}/.plugin/no-agents-json\""
+  fi
+else
+  bad "claude 命令不在查找路径里 —— 所有人的在线状态都会显示「状态未知」"
+  for p in /opt/homebrew/bin/claude /usr/local/bin/claude "$HOME/.local/bin/claude"; do
+    [ -x "$p" ] && { fix "其实装在 ${p}，只是当前环境找不到它"
+                     fix "把它加进查找路径：export PATH=\"$(dirname "$p"):\$PATH\""; break; }
+  done
+fi
+echo
+
+# ───────── 三、装对位置了吗 ─────────
+echo "【三、安装位置】"
+# 正常形态：作为插件装在 <配置目录>/plugins/cache/xbcx/team/<版本号>/
+# 判据不能写死完整路径 —— 版本号一变路径就变。只看它是不是落在插件缓存目录下。
+CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CACHE_ROOT="$CFG_DIR/plugins/cache/xbcx/team"
+# 判据只看**路径长什么样**，不绑当前 HOME：换个 HOME 跑、或者 CLAUDE_CONFIG_DIR
+# 指到别处，装得好好的也会被判成「没装对」。实测在临时 HOME 下跑就误报过。
+case "$SKILL_DIR" in
+  "$CACHE_ROOT"/*|*/plugins/cache/xbcx/team/*)
+    ok "作为插件装在 $SKILL_DIR"
+    ok "插件版本：$(basename "$SKILL_DIR")"
+    ;;
+  *)
+    # 从源码仓库直接跑不算故障 —— 开发和自测本来就在仓库里跑。
+    # 判据：这个目录里有插件清单，而且它在一个 git 仓库里。
+    if [ -f "$SKILL_DIR/.claude-plugin/plugin.json" ] \
+       && git -C "$SKILL_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+      warn "现在跑的是**源码仓库**里的那份：$SKILL_DIR"
+      fix "开发自测时这是对的。人日常用的是装好的那份："
+      fix "  $CACHE_ROOT/<版本号>/"
+      fix "改完记得 CHANGELOG + 版本号，再 claude plugin update team@xbcx，否则别人拉不到。"
+    else
+      bad "不在插件安装位置：当前在 $SKILL_DIR"
+      fix "正常应该在 $CACHE_ROOT/<版本号>/ 下面。"
+      fix "重新装一次："
+      fix "  claude plugin marketplace add https://git.xbwq.com.cn/waiqin/ai_dev_full.git"
+      fix "  claude plugin install team@xbcx --scope user"
+    fi
+    ;;
+esac
+
+# 老装法残留检查：两份并存会同时跑两个看门程序、两份同名技能
+if [ -d "$HOME/.claude/skills/team" ]; then
+  bad "老装法残留：$HOME/.claude/skills/team 还在"
+  fix "它会和插件版并存（两份同名技能、两个看门程序同时跑），删掉它："
+  fix "  rm -rf \"$HOME/.claude/skills/team\""
+  fix "顺便把个人全局设置 ~/.claude/settings.json 里手工写的 ccwatchdog 那两段也删掉"
+fi
+
+NOEXEC=0
+for f in "$SKILL_DIR"/bin/cc* "$SKILL_DIR"/bin/watcher.sh; do
+  [ -e "$f" ] || continue
+  [ -x "$f" ] || NOEXEC=$((NOEXEC+1))
+done
+if [ "$NOEXEC" -eq 0 ]; then
+  ok "所有命令都有执行权限"
+else
+  bad "$NOEXEC 个命令没有执行权限"
+  fix "chmod +x \"$SKILL_DIR\"/bin/*"
+fi
+
+# 注意：插件化之后值班守则挪进了 skills/team/ —— 那是插件规定的技能存放位置，不能挪回来
+for f in skills/team/SKILL.md README.md agent/加工员说明书.md bin/lib.sh bin/watcher.sh \
+         hooks/hooks.json hooks/lib.sh hooks/updater.sh hooks/on-session-start.sh hooks/on-prompt.sh; do
+  [ -f "$SKILL_DIR/$f" ] || bad "缺文件：$f"
+done
+CNT=$(ls -1 "$SKILL_DIR"/bin/cc* 2>/dev/null | wc -l | tr -d ' ')
+[ "$CNT" -ge 20 ] && ok "指令齐全（$CNT 条）" || warn "只有 $CNT 条指令，可能拷贝不完整"
+echo
+
+# ───────── 四、会话环境 ─────────
+echo "【四、会话环境】"
+if [ -n "$CLAUDE_CODE_SESSION_ID" ]; then
+  ok "会话编号可用（${CLAUDE_CODE_SESSION_ID:0:8}…）"
+else
+  warn "当前不在 Claude Code 会话里，拿不到会话编号"
+  fix "这不算故障 —— 你现在多半是在普通终端里跑体检。"
+  fix "但除了 ccdoctor，其余命令都必须在 Claude Code 会话里执行。"
+fi
+echo
+
+# ───────── 五、数据目录 ─────────
+echo "【五、数据目录】"
+if [ -d "$TEAM_ROOT" ]; then
+  ok "数据目录存在：$TEAM_ROOT"
+  [ -w "$TEAM_ROOT" ] && ok "可写" || bad "不可写 —— 检查权限"
+  G=$(find "$GROUPS_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  echo "       现有讨论组 $G 个，已结案 $(find "$CLOSED_DIR" -name '*.md' 2>/dev/null | wc -l | tr -d ' ') 份"
+  if [ -f "$TEAM_ROOT/.plugin/config" ]; then
+    ok "这台机器的配置：传话记录保留 ${TEAM_TALK_KEEP_DAYS} 天（改 $TEAM_ROOT/.plugin/config）"
+  else
+    ok "还没生成配置文件，用的是默认值（传话记录保留 ${TEAM_TALK_KEEP_DAYS} 天）"
+  fi
+  ST=$(find "$LOCK_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  [ "$ST" -eq 0 ] && ok "没有卡住的锁" || { warn "有 $ST 个锁没释放"; fix "跑 ccclean 清理"; }
+else
+  ok "数据目录还没建（第一次用时会自动创建，不用手动建）"
+fi
+
+# 同 ccme：只报真孤儿。机器上跑着几个收件程序本身不是问题 ——
+# 多端协作时每个在组的会话都该有一个。
+RUNNING=$(t_watcher_pids | wc -l | tr -d ' ')
+ORPH=$(t_orphan_watcher_pids | wc -l | tr -d ' ')
+[ "$RUNNING" -gt 0 ] && ok "收件程序在跑：$RUNNING 个（多端协作时每个在组的会话各一个，属正常）"
+[ "$ORPH" -gt 0 ] && { warn "其中 $ORPH 个没有主人（会话被强杀留下的）"; fix "跑 ccclean 清掉"; }
+echo
+
+
+# ───────── 六、代码自查（防止改坏） ─────────
+echo "【六、代码自查】"
+BADVAR=0
+for f in "$SKILL_DIR"/bin/*; do
+  [ -f "$f" ] || continue
+  # bash 3.2 会把紧跟在变量后面的中文字节当成变量名的一部分，
+  # 导致变量取空、中文变乱码，而且不报错。所有变量必须写成 ${变量} 形式。
+  n=$(perl -ne 'print if /\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7F])/' "$f" 2>/dev/null | wc -l | tr -d ' ')
+  [ "${n:-0}" -gt 0 ] && { bad "$(basename "$f")：$n 处变量后面紧跟中文，会取空变乱码"; BADVAR=$((BADVAR+n)); }
+done
+if [ "$BADVAR" -eq 0 ]; then
+  ok "没有「变量后紧跟中文」的写法"
+else
+  fix "改成 \${变量} 形式。批量修："
+  fix "  perl -i -pe 's/\\\$([A-Za-z_][A-Za-z0-9_]*)(?=[^\\x00-\\x7F])/\\\$\\{\$1\\}/g' \"$SKILL_DIR\"/bin/*"
+fi
+
+SYNERR=0
+for f in "$SKILL_DIR"/bin/*; do
+  [ -f "$f" ] || continue
+  head -1 "$f" | grep -q '^#!/bin/bash' || continue
+  bash -n "$f" 2>/dev/null || { bad "$(basename "$f") 语法错误"; SYNERR=$((SYNERR+1)); }
+done
+[ "$SYNERR" -eq 0 ] && ok "所有脚本语法正确"
+
+# ── 说法自查：行为改了，旧说法留在别处 ──
+#
+# 这一条不是洁癖，是反复踩出来的。改行为时，改的是**做这件事的那段代码**，
+# 而同一件事的说法散在别的命令、值班守则、提示文案里 —— 那些地方一个字都不会报错，
+# 测试也全绿，只有人照着旧说法去做才会踩到，而且踩到时多半怪不到这上面。
+# 实际发生过三轮：收件程序下班时机的说法散在四处；「退全部组要停掉收件程序」
+# 在 ccleave 改完、ccclose 和 ccwatch 漏了；组状态叫「就绪」却有提示写「完成」。
+#
+# 规则写成「作废说法 → 为什么作废」。加规则的时机就是改行为的那一刻。
+说法自查() {   # $1=不该出现的字样  $2=为什么
+  # 只看**会打给人看的那些行**。脚本注释里要能原样写出旧说法 ——
+  # 「这里以前写的是 X，为什么不对」正是最该留下的注释，不该被自己的检查判成违规。
+  # markdown 不做这个豁免：那里的每一行都是给人读的。
+  local hits
+  # 从源码仓库跑时，把仓库自己的引导脚本也扫进来。
+  # 它是唯一「从无到有」装插件的一环，却一直在检查视野之外 —— 实测出过事：
+  # 插件这边把机器路径改成英文名了，引导脚本还在写中文名，两套状态目录并存。
+  local extra=""
+  [ -f "$SKILL_DIR/../../.claude/hooks/bootstrap-team.sh" ] \
+    && extra="$SKILL_DIR/../../.claude/hooks/bootstrap-team.sh"
+  hits="$(grep -rn -- "$1" "$SKILL_DIR/bin" "$SKILL_DIR/skills" "$SKILL_DIR/hooks" $extra 2>/dev/null \
+          | grep -v '/ccdoctor:' \
+          | awk -F: '{ line=$0; sub(/^[^:]*:[0-9]*:/,"",line)
+                       if ($1 ~ /\.md$/) { print $1; next }
+                       sub(/^[ \t]+/,"",line)
+                       if (line ~ /过渡期兼容/) next            # 显式豁免：认老名字的兼容代码
+                       if (line !~ /^#/) print $1 }' \
+          | sort -u | sed "s|$SKILL_DIR/||" | tr '\n' ' ')"
+  [ -z "$hits" ] && return 0
+  bad "有作废的说法还留着：「$1」→ ${hits}"
+  fix "$2"
+  return 1
+}
+SAY=0
+说法自查 "停掉收件程序" "收件程序不能停：没组了代号还在，还接着传话台。该停的只有加工员。" || SAY=1
+说法自查 "收件程序和加工员都该停" "同上 —— 只有加工员该停。" || SAY=1
+说法自查 "置为「完成」" "组的状态叫「就绪」，命令是 --就绪。写「完成」会让人去找一个不存在的状态。" || SAY=1
+说法自查 "空转一小时" "「一小时空转自动下班」已取消：下班就没心跳，安静时段反而传不进话。" || SAY=1
+说法自查 "退出讨论组后" "判据早就从「在不在组里」改成「有没有代号」了。" || SAY=1
+说法自查 "claude-team/.插件检查" "机器用的隐藏路径一律英文（这条会被写进 settings.json 由 Claude Code 执行）。" || SAY=1
+说法自查 "claude-team/.状态栏" "同上：改用 .statusline/。" || SAY=1
+说法自查 "bin路径" "同上：改用 binpath。" || SAY=1
+说法自查 "上次失败" "同上：改用 lastfail。读写两边用不同名字时，失败退避那道闸等于没有。" || SAY=1
+说法自查 "副本损坏次数" "同上：改用 brokencount。" || SAY=1
+说法自查 "回执.txt" "同上：改用 receipt.txt。" || SAY=1
+# 子命令一律用英文。人说中文话照样听得懂，但**文档里不该再出现中文子命令** ——
+# 人照着敲，敲的是一个我们不再维护写法的东西。
+for _zh in 代号 传给 加入 退出 谁在 地址簿 收件箱 补课 流水 回执 认领 结案 找回 档位 清理 对账 体检 素材 深挖 准备 状态栏; do
+  说法自查 "/team ${_zh}" "子命令一律用英文（人说中文话仍然听得懂，那是自然语句、不是子命令）。" || SAY=1
+done
+[ "$SAY" -eq 0 ] && ok "没有已作废的说法残留（$(printf '%s' "5") 条规则全过）"
+echo
+
+# ───────── 结论 ─────────
+echo "════════ 结论 ════════"
+printf '  通过 %s 项，提醒 %s 项，问题 %s 项\n\n' "$PASS" "$WARN" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  echo "  ❌ 有 $FAIL 项过不了，现在还不能正常用。按上面的 → 提示逐条修。"
+  exit 1
+elif [ "$WARN" -gt 0 ]; then
+  echo "  ⚠️  能用，但有 $WARN 项值得注意（看上面的提醒）。"
+  exit 0
+else
+  echo "  ✅ 一切正常，可以用了。"
+  echo
+  echo "  怎么开始：在 Claude Code 会话里跟它说人话就行，例如"
+  echo "    「建一个叫 XX 的讨论组，我负责 YY」"
+  echo "    「把这个结论同步给组里其他人」"
+  echo "  你不需要手敲任何命令。"
+  exit 0
+fi

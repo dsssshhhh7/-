@@ -1,0 +1,29 @@
+#!/bin/bash
+# cccatch —— 补课：重读某个组当前有效的全部约定
+#   cccatch <组名>       看一个组
+#   cccatch              看我加入的所有组
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+show() {
+  local g="$1"
+  t_group_exists "$g" || { t_warn "没有这个组：$g"; return 1; }
+  echo "═══════════ 【${g}】当前共识 ═══════════"
+  cat "$(t_group_consensus "$g")"
+  echo
+  echo "  组内成员："
+  t_members_of "$g" | while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    printf '    %s %s %s\n' "$(t_pad "$(t_display "$m")" 16)" "$(t_pad "$(t_status_of "$m")" 10)" "$(t_member_role "$g" "$m")"
+  done
+  echo "═══════════════════════════════════════"
+  echo
+}
+
+if [ -n "$1" ]; then
+  show "$1"
+else
+  groups="$(t_my_groups)"
+  [ -n "$groups" ] || { echo "你没加入任何讨论组。"; exit 0; }
+  while IFS= read -r g; do [ -n "$g" ] && show "$g"; done <<< "$groups"
+fi

@@ -1,0 +1,151 @@
+#!/bin/bash
+# ccsync —— 索引对账
+# 扫一遍当前真实活跃的会话，把索引里的系统名和活跃时间更新回来，
+# 并列出「在跑但没收编」和「收编了但已关闭」的，供你决定。
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+# ── 清理：把「不在任何组 + 长期没动静」的在册记录删掉 ──
+# 只删索引那一行（代号随之释放）。会话目录、信箱一个字都不动 ——
+# 那里面是历史消息，删不删是另一件事，要人单独说。
+if [ "$1" = "--清理" ] || [ "$1" = "--prune" ]; then
+  STALE="$(t_stale_index_ids)"
+  [ -n "$STALE" ] || { echo "没有可清的：在组里的和在线的一律不清。"; exit 0; }
+  t_lock 索引 || t_die "索引被占用"
+  n=0
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    a="$(t_alias_of "$id")"
+    days=$(( $(t_last_seen_age "$id") / 86400 ))
+    # 清之前先把「它名下还剩什么」摆出来 —— 会话目录和信箱不跟着删，
+    # 人得知道那些东西还在哪、占多大，才好决定要不要另外处理
+    sdir="$SESSIONS_DIR/$id"
+    unread=0
+    [ -d "$sdir/收件箱" ] && unread=$(find "$sdir/收件箱" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    size="$(du -sh "$sdir" 2>/dev/null | cut -f1)"
+    t_index_remove "$id"
+    t_alias_history_add "$a" "$id" "-" "对账清理（${days} 天没动静、不在任何组）"
+    printf '  已清：%s 原编号 %s\n' "$(t_pad "$a" 16)" "$id"
+    printf '        它名下还留着：信箱 %s 条，目录 %s（%s），**没删**\n' \
+      "$unread" "$sdir" "${size:-未知大小}"
+    n=$((n + 1))
+  done <<< "$STALE"
+  t_unlock 索引
+  echo
+  t_ok "清掉 ${n} 条，这些代号现在可以被别的窗口用了。"
+  echo "  每条都记进了 $(t_alias_history) —— 以后想查「这个名字当初是谁」还查得到。"
+  echo "  会话目录和信箱没动，还在 ${SESSIONS_DIR}/ 下面。"
+  exit 0
+fi
+
+echo "正在对账…"
+echo
+
+# ── 组归属对账 ──
+# 索引里的「在哪些组」只是给人看的缓存，真相在各组的成员表里。两者会脱节：
+# 组被直接删掉、或者成员表被改过，索引却还记着旧的。
+# 后果很实在：ccjoin 信索引，会以为你已经是成员而跳过写入成员表，
+# 结果是「建组说成功了，但你不在这个组里」。所以这里按成员表重算一遍。
+t_real_groups_of() {
+  local id="$1" out="" gd mf
+  for gd in "$GROUPS_DIR"/*/; do
+    [ -d "$gd" ] || continue
+    mf="${gd}成员.md"
+    [ -f "$mf" ] || continue
+    grep -q "^| *${id} *|" "$mf" 2>/dev/null && out="${out:+${out},}$(basename "$gd")"
+  done
+  printf '%s' "$out"
+}
+
+updated=0
+fixed=0
+t_lock 索引 || t_die "索引被占用"
+while IFS= read -r id; do
+  [ -z "$id" ] && continue
+  st="$(t_status_of "$id")"
+  old_g="$(t_groups_of "$id")"
+  # 索引里「没有组」写的是一个横杠（表格空着不好看），而重算出来是空字符串。
+  # 不把这两个当成一回事的话，每个「有代号但没进组」的窗口都会被报成
+  # 「组归属对不上」——每次对账都报一遍，而且永远修不掉。
+  [ "$old_g" = "-" ] && old_g=""
+  new_g="$(t_real_groups_of "$id")"
+  if [ "$old_g" != "$new_g" ]; then
+    disp="$(t_display "$id" 2>/dev/null)"; [ -n "$disp" ] || disp="$id"
+    echo "  🔧 ${disp} 的组归属对不上：索引写「${old_g:-无}」，成员表里实际是「${new_g:-无}」→ 已按成员表更正"
+    fixed=$((fixed + 1))
+  fi
+  if [ "$st" != "已关闭" ] || [ "$old_g" != "$new_g" ]; then
+    t_index_upsert "$id" "$(t_alias_of "$id")" "$new_g"
+    [ "$st" != "已关闭" ] && updated=$((updated + 1))
+  fi
+done <<< "$(t_index_all_ids)"
+t_unlock 索引
+# ⚠️ 这里说的「活跃时间」= 索引里那一行上次被写的时间，**不是在线判断的依据**。
+#    在不在线一律看心跳（收件程序在岗时每 30 秒碰一次），别拿这一列当在线看。
+echo "已更新 ${updated} 个会话的系统名和「这行上次被写的时间」（在线与否看心跳，不看这一列）。"
+[ "$fixed" -gt 0 ] && echo "修正了 ${fixed} 处对不上的组归属（以成员表为准）。"
+echo
+
+# 在册但已关闭
+echo "── 在册但已关闭（消息会堆在它们信箱里等着）──"
+found=0
+while IFS= read -r id; do
+  [ -z "$id" ] && continue
+  if [ "$(t_status_of "$id")" = "已关闭" ]; then
+    inbox="$SESSIONS_DIR/$id/收件箱"
+    unread=0
+    [ -d "$inbox" ] && unread=$(find "$inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    printf '  %s %s   未读 %s 条   恢复：ccresume "%s"\n' "$(t_pad "$(t_alias_of "$id")" 16)" "${id:0:8}…" "$unread" "$(t_alias_of "$id")"
+    found=1
+  fi
+done <<< "$(t_index_all_ids)"
+[ "$found" -eq 0 ] && echo "  （没有）"
+echo
+
+# 在跑但没收编
+echo "── 正在跑但还没收编的会话 ──"
+found=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  id="${line%%|*}"; nm="${line##*|}"
+  if ! t_index_has "$id"; then
+    printf '  %s %s\n' "$(t_pad "$nm" 16)" "${id:0:8}…"
+    found=1
+  fi
+done <<< "$(t_agents_json | jq -r '.[] | "\(.sessionId)|\(.name)"' 2>/dev/null)"
+if [ "$found" -eq 0 ]; then
+  echo "  （没有，全都收编了）"
+else
+  echo
+  echo "  要它进组：去那个窗口敲 ccjoin <组名> --代号 <代号>"
+  echo "  只想给它起个名字（不进组也能起，状态栏上就能认出它）：ccname <代号>"
+fi
+
+# ── 长期没动静、又不在任何组的在册记录 ──
+#
+# 退出全部组之后代号是留着的（那是有意的：代号是窗口的身份，不是组籍），
+# 代价就是这张表只增不减。所以定期把「不在任何组 + 长期没动静」的挑出来。
+#
+# ⚠️ 只提醒，不自动删 —— 这套机制里删东西一律要人点头。
+#    在组里的和在线的一个都不挑，判据跟「能不能顶掉这个代号」是同一套。
+echo
+echo "── 长期没动静、且不在任何组的在册记录 ──"
+STALE="$(t_stale_index_ids)"
+if [ -z "$STALE" ]; then
+  echo "  （没有，这张表是干净的）"
+else
+  n=0
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    n=$((n + 1))
+    days=$(( $(t_last_seen_age "$id") / 86400 ))
+    inbox="$SESSIONS_DIR/$id/收件箱"
+    unread=0
+    [ -d "$inbox" ] && unread=$(find "$inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    printf '  %s %s 天没动静   信箱 %s 条   %s\n' \
+      "$(t_pad "$(t_alias_of "$id")" 16)" "$days" "$unread" "$(_index_field "$id" 4)"
+  done <<< "$STALE"
+  echo
+  echo "  共 ${n} 条。清掉它们（只删索引那一行，代号随之释放）：ccsync --清理"
+  echo "  会话目录和信箱**不会**跟着删 —— 那是另一件事，要删得你单独说。"
+fi

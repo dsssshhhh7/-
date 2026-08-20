@@ -1,0 +1,76 @@
+#!/bin/bash
+# ccclean —— 清理残留
+# 会话被强杀（不是正常退出）时，它的收件程序会变成没主的孤儿进程继续空转。
+# 这条命令找出这类进程并清掉，顺便修掉失效的锁和记录。
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+echo "正在检查残留…"
+echo
+
+# ── 1. 孤儿收件程序 ──
+echo "── 收件程序 ──"
+killed=0
+for pid in $(t_watcher_pids); do
+  owner=""
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    pf="$d/.watcher.pid"
+    [ -f "$pf" ] && [ "$(cat "$pf" 2>/dev/null)" = "$pid" ] && owner="$(basename "$d")"
+  done <<< "$(find "$SESSIONS_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)"
+
+  if [ -z "$owner" ]; then
+    echo "  孤儿进程 ${pid}（没有会话认领）→ 清掉"
+    kill "$pid" 2>/dev/null && killed=$((killed + 1))
+  else
+    st="$(t_status_of "$owner")"
+    if [ "$st" = "已关闭" ]; then
+      echo "  进程 ${pid} 属于已关闭的会话 $(t_display "$owner") → 清掉"
+      kill "$pid" 2>/dev/null && killed=$((killed + 1))
+      rm -f "$SESSIONS_DIR/$owner/.watcher.pid"
+    else
+      echo "  进程 ${pid} 属于 $(t_display "$owner")（${st}）→ 保留"
+    fi
+  fi
+done
+[ "$killed" -eq 0 ] && echo "  没有需要清理的" || echo "  共清理 ${killed} 个"
+echo
+
+# ── 2. 失效的 pid 记录 ──
+echo "── 失效的进程记录 ──"
+n=0
+while IFS= read -r pf; do
+  [ -z "$pf" ] && continue
+  p="$(cat "$pf" 2>/dev/null)"
+  if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+    rm -f "$pf"; n=$((n + 1))
+  fi
+done <<< "$(find "$SESSIONS_DIR" -maxdepth 2 -name '.watcher.pid' 2>/dev/null)"
+echo "  清掉 ${n} 个"
+echo
+
+# ── 3. 卡住的锁 ──
+echo "── 卡住的锁 ──"
+n=0
+while IFS= read -r d; do
+  [ -z "$d" ] && continue
+  age=$(( $(t_epoch) - $(cat "$d/epoch" 2>/dev/null || echo 0) ))
+  if [ "$age" -gt 60 ]; then
+    echo "  $(basename "$d")（卡了 ${age} 秒）→ 清掉"
+    rm -rf "$d"; n=$((n + 1))
+  fi
+done <<< "$(find "$LOCK_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)"
+[ "$n" -eq 0 ] && echo "  没有"
+echo
+
+# ── 4. 索引里指向已关闭会话的条目 ──
+echo "── 在册但已关闭的会话 ──"
+n=0
+while IFS= read -r id; do
+  [ -z "$id" ] && continue
+  [ "$(t_status_of "$id")" = "已关闭" ] && {
+    printf '  %s 恢复它：ccresume "%s"\n' "$(t_pad "$(t_alias_of "$id")" 16)" "$(t_alias_of "$id")"
+    n=$((n + 1))
+  }
+done <<< "$(t_index_all_ids)"
+[ "$n" -eq 0 ] && echo "  没有" || echo "  （这些不自动清 —— 关窗口不等于退出协作，它们的消息还堆着等回来）"

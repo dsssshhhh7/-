@@ -1,0 +1,91 @@
+#!/bin/bash
+# ccme —— 我是谁：代号、编号、在哪些组、什么在跑、什么在烧钱
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+t_ensure_skeleton
+ME="$(t_sid)"
+
+ALIAS="$(t_alias_of "$ME")"
+SYSNAME="$(t_sysname_of "$ME")"
+CWD="$(t_cwd_of "$ME")"
+MY_GROUPS="$(t_my_groups)"
+
+echo "代号：  ${ALIAS:-（还没登记——ccname <代号> 就能起，不用先进组）}"
+echo "编号：  $ME"
+echo "系统名：${SYSNAME:-未知}"
+echo "目录：  ${CWD:-$PWD}"
+echo
+
+if [ -z "$MY_GROUPS" ]; then
+  echo "协作状态：没有加入任何讨论组"
+  if [ -n "$ALIAS" ]; then
+    # ⚠️ 有代号 ≠ 零影响：登记代号就等于接入传话台，别人随时能传话进来，
+    #    所以收件程序**该在岗**（它 5 秒扫一次文件，不花词元）。
+    echo "  → 但你有代号【${ALIAS}】—— 也就是接入了传话台，别人可以直接传话给你。"
+    echo "     收件程序该在岗（下面看得到）；不在岗的话你在别人地址簿里显示为「离线」。"
+    echo "     彻底退出：ccname --注销（代号释放，收件程序跟着下班）。"
+  else
+    echo "  → 这套机制对本会话零影响：不跑后台程序、不改任何行为。"
+    echo "     想能收传话：起个代号就行（ccname <代号>），不用先进组。"
+  fi
+else
+  echo "已加入协作："
+  while IFS= read -r g; do
+    [ -z "$g" ] && continue
+    if t_group_exists "$g"; then
+      n="$(t_members_of "$g" | wc -l | tr -d ' ')"
+      role="$(t_member_role "$g" "$ME")"
+      printf '  %s %s 人   我负责：%s\n' "$(t_pad "$g" 28)" "$n" "${role:-未填}"
+    else
+      printf '  %s ⚠️ 组文件夹不见了（可能已结案）\n' "$(t_pad "$g" 28)"
+    fi
+  done <<< "$MY_GROUPS"
+fi
+echo
+
+# ── 什么在跑 ──
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "运行中的机制："
+  echo "  原生任务消息：可唤醒 idle 任务，不运行 watcher"
+  echo "  共享账本：${TEAM_ROOT}"
+  echo "  smart 加工员：Codex 版不启用"
+  exit 0
+fi
+
+echo "运行中的机制："
+
+if t_watcher_running; then
+  # 右边那列靠算显示宽度对齐，别手敲空格 —— 状态文字一变（分钟数多一位）就歪。
+  printf '  %s%s%s\n' "$(t_pad "收件程序：" 12)" "$(t_pad "在岗（5 秒轮询）" 30)" "不花钱"
+else
+  if [ -n "$MY_GROUPS" ]; then
+    echo "  收件程序：⚠️ 不在岗，但你在协作中 —— 收不到消息！"
+    echo "            → 让会话重新起一个（见 SKILL.md 的起收件程序步骤）"
+  else
+    echo "  收件程序：未运行（不在协作中，本该如此）"
+  fi
+fi
+
+MODE_FILE="$(t_mydir)/.gear"
+MODE="$(cat "$MODE_FILE" 2>/dev/null || echo simple)"
+AGENT_FILE="$(t_mydir)/.agent"
+
+if [ -f "$AGENT_FILE" ]; then
+  started="$(head -1 "$AGENT_FILE" 2>/dev/null || echo 0)"
+  hold="$(sed -n '2p' "$AGENT_FILE" 2>/dev/null)"
+  mins=$(( ( $(t_epoch) - started ) / 60 ))
+  printf '  %s%s%s\n' "$(t_pad "加工员：" 12)" "$(t_pad "在岗 ${mins} 分钟" 30)" "会花钱"
+  [ -n "$hold" ] && echo "            已锁定不下班，到 $(t_fmt_epoch "$hold" "+%H:%M")"
+else
+  printf '  %s%s%s\n' "$(t_pad "加工员：" 12)" "$(t_pad "不在岗" 30)" "不花钱"
+fi
+printf "  %s%s\n" "$(t_pad "档位：" 12)" "$MODE"
+echo
+
+# ── 孤儿进程检查 ──
+# ⚠️ 只数【真孤儿】，不能拿机器上的总数跟「本会话该有 1 个」比 ——
+#    多端协作时组里 5 个人就该有 5 个收件程序，那么比法每个端都会误报（实测撞到过）。
+orphans="$(t_orphan_watcher_pids | wc -l | tr -d ' ')"
+if [ "$orphans" -gt 0 ]; then
+  echo "⚠️  有 $orphans 个收件程序没有主人（会话被强杀留下的），跑 ccclean 清理。"
+fi

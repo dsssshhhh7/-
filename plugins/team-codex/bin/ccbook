@@ -1,0 +1,92 @@
+#!/bin/bash
+# ccbook —— 地址簿：所有登记过代号的窗口，谁在线、谁离线多久
+#
+#   ccbook            全部
+#   ccbook <代号>      只看一个（发消息前确认对方在不在）
+#
+# 这是「发之前先看对方在不在」的那块依据。在线与否**只看心跳**
+# （收件程序在岗时每一轮碰一次，约 5 秒），不去问 Claude Code 的进程列表 ——
+# 那条路要另起进程、还依赖 jq，几百毫秒，摆在这种高频动作前面不合适。
+#
+# ⚠️ 心跳只在收件程序跑着时才有：窗口开着但没起收件程序 = 显示离线。
+#    这是对的，它本来就收不到消息。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+ME="$(t_sid)"
+WANT="$1"
+
+# 一行：代号 / 在线状态 / 在哪些组 / 未读 / 目录
+_row() {
+  local id="$1" alias online groups unread inbox mark cwd
+  alias="$(t_alias_of "$id")"
+  [ -n "$alias" ] || return 0
+  online="$(t_online_text "$id")"
+  groups="$(t_groups_of "$id")"
+  case "$groups" in ''|'-') groups="未进组" ;; esac
+  inbox="$SESSIONS_DIR/$id/收件箱"
+  unread=0
+  [ -d "$inbox" ] && unread=$(find "$inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$unread" = "0" ] && unread="—"
+  cwd="$(_index_field "$id" 4)"
+  case "$cwd" in "$HOME"*) cwd="~${cwd#$HOME}" ;; esac
+  mark=""; [ "$id" = "$ME" ] && mark="  ← 我"
+  printf '  %s%s%s%s%s%s\n' \
+    "$(t_pad "$alias" 16)" "$(t_pad "$online" 25)" "$(t_pad "$groups" 24)" \
+    "$(t_pad "$unread" 6)" "$cwd" "$mark"
+}
+
+# ── 只看一个 ──
+if [ -n "$WANT" ]; then
+  ID="$(t_id_of "$WANT")"
+  [ -n "$ID" ] || t_die "地址簿里没有代号【${WANT}】。跑 ccbook 看现有的。"
+  echo "  代号            在线情况                 在哪些组                未读  目录"
+  echo "  ────────────────────────────────────────────────────────────────────────────"
+  _row "$ID"
+  echo
+  if t_is_online "$ID"; then
+    echo "✅ 在线，可以发。"
+  else
+    echo "❌ 不在线 —— 发过去它不会报错，消息会一直躺在信箱里没人看。"
+    echo "   三条路：等它 / 把它找回来（ccresume \"${WANT}\"）/ 改发给别人"
+  fi
+  exit 0
+fi
+
+# ── 全部：在线的排前面，其余按离线时长从短到长 ──
+TMP="$(mktemp)"
+while IFS= read -r id; do
+  [ -z "$id" ] && continue
+  age="$(t_offline_age "$id")"
+  # 排序键：在线=0，没心跳=最大，其余按离线秒数
+  if   [ "$age" -lt 0 ]; then key=999999999
+  elif t_is_online "$id"; then key=0
+  else key="$age"; fi
+  printf '%012d\t%s\n' "$key" "$id" >> "$TMP"
+done <<< "$(t_index_all_ids)"
+
+if [ ! -s "$TMP" ]; then
+  rm -f "$TMP"
+  echo "地址簿是空的 —— 还没有任何窗口登记过代号。"
+  echo "给这个窗口起一个：ccname <代号>（不用先进组）"
+  exit 0
+fi
+
+echo "地址簿（登记过代号的窗口）："
+echo
+echo "  代号            在线情况                 在哪些组                未读  目录"
+echo "  ────────────────────────────────────────────────────────────────────────────"
+while IFS=$'\t' read -r _ id; do
+  [ -n "$id" ] && _row "$id"
+done <<< "$(sort "$TMP")"
+rm -f "$TMP"
+
+echo
+ON=0; OFF=0
+while IFS= read -r id; do
+  [ -z "$id" ] && continue
+  [ -n "$(t_alias_of "$id")" ] || continue
+  if t_is_online "$id"; then ON=$((ON + 1)); else OFF=$((OFF + 1)); fi
+done <<< "$(t_index_all_ids)"
+echo "  在线 ${ON} 个，离线 ${OFF} 个。在线判据：收件程序 ${TEAM_BEAT_STALE} 秒内有过心跳。"

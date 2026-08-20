@@ -1,0 +1,105 @@
+#!/bin/bash
+# ccupdate —— 现在就去查一次更新，不等那些闸门
+#
+#   ccupdate            查一次；有新版就装上
+#   ccupdate --只看看   只报当前版本和最新版本，不动手
+#
+# 平时更新是自动的：开窗口查一次，你说话时也查但 12 小时最多一次，
+# 失败了还会退避 4 小时不重试。这几道闸是为了不刷屏、不反复失败，
+# 但它们也意味着「我刚推了一版，想立刻拿到」时得干等。这条命令就是绕开它们。
+#
+# ⚠️ 它是**当场跑完再返回**的，不像自动更新那样甩到后台 —— 因为你是特意来查的，
+#    结果得当场看到。装新版要几秒到几十秒（要拉一次仓库）。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "Codex 插件更新通过 marketplace 重新安装完成；更新后请新建任务加载新版。"
+  exit 0
+fi
+t_ensure_skeleton
+
+PEEK=0
+[ "$1" = "--只看看" ] || [ "$1" = "--peek" ] && PEEK=1
+
+CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CACHE_ROOT="${CFG_DIR}/plugins/cache/xbcx/team"
+# 按 HOME 算出来的位置要是空的，就从**当前这份代码在哪**倒推 ——
+# 换个 HOME 跑（自测、排障）时前者会指到一个空目录，报出来的版本全是空的。
+if [ ! -d "$CACHE_ROOT" ] || [ -z "$(ls -1 "$CACHE_ROOT" 2>/dev/null)" ]; then
+  case "$SKILL_DIR" in
+    */plugins/cache/xbcx/team/*) CACHE_ROOT="${SKILL_DIR%/plugins/cache/xbcx/team/*}/plugins/cache/xbcx/team" ;;
+  esac
+fi
+WORK="${TEAM_ROOT}/.plugin"
+
+_installed() { ls -1 "$CACHE_ROOT" 2>/dev/null | sort -V | tail -1; }
+
+BEFORE="$(_installed)"
+echo "════════ 查更新 ════════"
+echo "  这台机器装着：${BEFORE:-（还没装）}"
+_running="$(basename "$SKILL_DIR")"
+case "$_running" in
+  [0-9]*.[0-9]*) echo "  正在跑的这份：${_running}" ;;
+  *)             echo "  正在跑的这份：源码仓库（${SKILL_DIR}）" ;;
+esac
+
+# 市场副本里的版本号 = 远端最新
+MKT="${CFG_DIR}/plugins/marketplaces/xbcx/plugins/team/.claude-plugin/plugin.json"
+if [ ! -f "$MKT" ]; then
+  # 目录布局各版本不一样，兜底靠搜；两个可能的根都搜一遍
+  for _r in "${CFG_DIR}/plugins" "${CACHE_ROOT%/plugins/cache/*}/plugins"; do
+    [ -d "$_r" ] || continue
+    MKT="$(find "$_r" -path '*xbcx*' -path '*team*' -name plugin.json 2>/dev/null | grep -v '/cache/' | head -1)"
+    [ -n "$MKT" ] && break
+  done
+fi
+
+if [ "$PEEK" -eq 1 ]; then
+  LATEST="$(sed -n 's/.*"version"[^"]*"\([^"]*\)".*/\1/p' "$MKT" 2>/dev/null | head -1)"
+  echo "  市场副本里的：${LATEST:-（查不到，副本可能还没拉过）}"
+  echo
+  echo "（--只看看 不动手。副本本身也可能是旧的，真要拿最新的就直接跑 ccupdate）"
+  exit 0
+fi
+
+# 把「失败退避」和「12 小时闸门」这两道戳清掉 —— 你是特意来查的
+# 新老两个名字都清：老装机上写的还是中文名那份（更新程序改名改晚了）
+rm -f "${WORK}/lastfail" "${WORK}/lastcheck" "${WORK}/上次失败" "${WORK}/上次刷新" 2>/dev/null   # 过渡期兼容
+
+UP="${WORK}/updater.sh"
+if [ ! -f "$UP" ]; then
+  SRC="${CLAUDE_PLUGIN_ROOT:-$SKILL_DIR}/hooks/updater.sh"
+  [ -f "$SRC" ] || t_die "找不到更新程序（${SRC}）—— 插件装得不完整，先跑 ccdoctor"
+  mkdir -p "$WORK" 2>/dev/null
+  cp "$SRC" "$UP" && chmod +x "$UP"
+fi
+
+echo
+echo "  正在拉取并比对…（要几秒）"
+bash "$UP" refresh
+RC=$?
+
+AFTER="$(_installed)"
+echo
+if [ "$AFTER" != "$BEFORE" ]; then
+  t_ok "已更新：${BEFORE:-无} → ${AFTER}"
+  echo
+  echo "  ⚠️ **已经开着的窗口用的还是启动时那一版** —— 这条命令也不例外。"
+  echo "     要让新版真正生效，重开一个窗口；收件程序也要重起一次才吃上新代码。"
+elif [ "$RC" -ne 0 ]; then
+  t_warn "这次没查成（更新程序退出码 ${RC}）。"
+  echo "     常见原因：拉不到仓库（网络 / git 装了两套、坏的那套排在前面）。"
+  echo "     跑 ccdoctor 看环境，或手动试一次：claude plugin marketplace update xbcx"
+else
+  echo "  已经是最新的（${AFTER}），没有可更新的。"
+fi
+
+# 更新程序留的话，当场递出来，别等下次开窗口
+R="${WORK}/receipt.txt"
+if [ -f "$R" ]; then
+  echo
+  echo "  ── 更新程序留的话 ──"
+  sed 's/^/     /' "$R"
+  rm -f "$R"
+fi

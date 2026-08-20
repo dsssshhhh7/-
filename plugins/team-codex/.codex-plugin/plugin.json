@@ -1,0 +1,32 @@
+{
+  "name": "team-codex",
+  "version": "1.0.3+codex.20260818091129",
+  "description": "\u591a\u4e2a Codex \u4efb\u52a1\u4e4b\u95f4\u6309\u4ee3\u53f7\u4f20\u8bdd\u3001\u7ec4\u961f\u5e7f\u64ad\u3001\u81ea\u52a8\u8865\u8bfe\u548c\u7ed3\u6848",
+  "author": {
+    "name": "\u5c0f\u6b65\u5916\u52e4 AI \u5f00\u53d1\u7ec4"
+  },
+  "repository": "https://git.xbwq.com.cn/duanshenghai/myself.git",
+  "keywords": [
+    "\u534f\u4f5c",
+    "\u591a\u4efb\u52a1",
+    "\u8de8\u7aef",
+    "team"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "\u591a\u7aef\u534f\u4f5c",
+    "shortDescription": "Codex \u4efb\u52a1\u4e4b\u95f4\u81ea\u52a8\u4f20\u8bdd\u548c\u7ec4\u961f\u534f\u4f5c",
+    "longDescription": "\u590d\u7528\u5c0f\u6b65\u5916\u52e4 Claude team \u7684\u5171\u4eab\u8d26\u672c\u3001\u5171\u8bc6\u3001\u6d41\u6c34\u3001\u56de\u6267\u548c\u7ed3\u6848\u673a\u5236\uff0c\u4f7f\u7528 Codex \u539f\u751f\u4efb\u52a1\u6d88\u606f\u5524\u9192\u5176\u4ed6\u7a7a\u95f2\u4efb\u52a1\u3002",
+    "developerName": "\u5c0f\u6b65\u5916\u52e4 AI \u5f00\u53d1\u7ec4",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "\u4ee3\u53f7\u53eb \u5b89\u5353",
+      "\u4f20\u7ed9 \u670d\u52a1\u7aef\uff1a\u8bf7\u786e\u8ba4\u8fd9\u4e2a\u5b57\u6bb5\u73b0\u5728\u4e0b\u53d1\u4ec0\u4e48",
+      "/team join \u8de8\u7aef\u534f\u4f5c\u9a8c\u8bc1"
+    ]
+  }
+}

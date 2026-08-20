@@ -1,0 +1,45 @@
+#!/bin/bash
+# ccgroups —— 现有哪些讨论组，各几人，多久没动静
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+t_ensure_skeleton
+ME="$(t_sid)"
+groups="$(t_all_groups)"
+
+if [ -z "$groups" ]; then
+  echo "还没有任何讨论组。"
+  echo "用 ccjoin <组名> --新建 建第一个，组名建议格式：<项目>-<需求>，例如 外勤-定位上报改造"
+  exit 0
+fi
+
+echo "现有讨论组："
+echo
+i=0
+while IFS= read -r g; do
+  [ -z "$g" ] && continue
+  i=$((i + 1))
+  n="$(t_members_of "$g" | wc -l | tr -d ' ')"
+  log="$(t_group_log "$g")"
+  if [ -f "$log" ]; then
+    mtime=$(t_mtime "$log")
+    days=$(( ( $(t_epoch) - mtime ) / 86400 ))
+    hours=$(( ( $(t_epoch) - mtime ) / 3600 ))
+    if   [ "$days" -ge 1 ]; then last="${days} 天前"
+    elif [ "$hours" -ge 1 ]; then last="${hours} 小时前"
+    else last="刚刚"; fi
+  else
+    days=0; last="未知"
+  fi
+
+  mark=""
+  t_is_member "$g" "$ME" && mark="  ← 我在这个组"
+  warn=""
+  [ "$days" -ge 30 ] && warn="   ⚠️ 建议结案（ccclose）"
+
+  printf '  %d. %s %s 人   最后活动 %s%s%s\n' "$i" "$(t_pad "$g" 28)" "$n" "$last" "$mark" "$warn"
+done <<< "$groups"
+
+echo
+echo "  n. 新建一个组"
+echo
+echo "加入：ccjoin <组名>    或直接 ccjoin 从列表里选（不会打错字）"

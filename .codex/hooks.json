@@ -1,0 +1,19 @@
+{
+  "description": "进入本仓库时安装或更新 Codex 多端协作插件",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -File \"$(git rev-parse --show-toplevel)/plugins/team-codex/scripts/install-user.ps1\" -Quiet",
+            "commandWindows": "pwsh -NoProfile -Command \"& { $root = git rev-parse --show-toplevel; & (Join-Path $root 'plugins/team-codex/scripts/install-user.ps1') -Quiet }\"",
+            "timeout": 20,
+            "statusMessage": "正在检查 Codex 协作插件"
+          }
+        ]
+      }
+    ]
+  }
+}

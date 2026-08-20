@@ -1,0 +1,72 @@
+#!/bin/bash
+# ccwake —— 主动叫加工员上岗
+#
+#   ccwake              叫它上岗（已在岗就报告状态）
+#   ccwake --2h         上岗并锁定 2 小时不下班（支持 30m / 1h / 2h / 4h）
+#
+# 什么时候用：
+#   · 接下来要密集对接 → 提前叫起来，第一条消息就有过滤，不会漏网
+#   · 加工员意外挂了   → 手动补起来
+#
+# 加工员平时是「卡在一条等消息的命令上」，不花钱；
+# 但每 10 分钟必须醒一次续命，那一下要花钱。连续空等 1 小时就自动下班。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "Codex 不运行常驻加工员；目标任务由原生消息按需唤醒。"
+  exit 0
+fi
+t_ensure_skeleton
+t_ensure_mydir
+
+AGENT_FILE="$(t_mydir)/.agent"
+MODE_FILE="$(t_mydir)/.gear"
+MODE="$(cat "$MODE_FILE" 2>/dev/null || echo simple)"
+
+HOLD_SEC=0
+case "$1" in
+  --30m) HOLD_SEC=1800 ;;
+  --1h)  HOLD_SEC=3600 ;;
+  --2h)  HOLD_SEC=7200 ;;
+  --4h)  HOLD_SEC=14400 ;;
+  "")    ;;
+  *)     t_die "时长只支持 --30m / --1h / --2h / --4h" ;;
+esac
+
+if [ -f "$AGENT_FILE" ]; then
+  started="$(head -1 "$AGENT_FILE" 2>/dev/null || echo 0)"
+  hold="$(sed -n '2p' "$AGENT_FILE" 2>/dev/null)"
+  mins=$(( ( $(t_epoch) - started ) / 60 ))
+  echo "加工员已在岗 ${mins} 分钟，不用重复叫。"
+  if [ -n "$hold" ] && [ "$hold" -gt "$(t_epoch)" ] 2>/dev/null; then
+    echo "  已锁定不下班，到 $(t_fmt_epoch "$hold" "+%H:%M")"
+  else
+    echo "  按默认规则：连续空等满 1 小时自动下班"
+  fi
+  [ "$HOLD_SEC" -gt 0 ] && {
+    printf '%s\n%s\n' "$started" "$(( $(t_epoch) + HOLD_SEC ))" > "$AGENT_FILE"
+    echo "  已改成锁定到 $(t_fmt_epoch "$(( $(t_epoch) + HOLD_SEC ))" "+%H:%M")"
+  }
+  exit 0
+fi
+
+# 标记上岗意图。真正起加工员是会话的活 —— 脚本起不了子代理。
+if [ "$HOLD_SEC" -gt 0 ]; then
+  printf '%s\n%s\n' "$(t_epoch)" "$(( $(t_epoch) + HOLD_SEC ))" > "$AGENT_FILE"
+else
+  printf '%s\n\n' "$(t_epoch)" > "$AGENT_FILE"
+fi
+
+[ "$MODE" != "smart" ] && { echo "smart" > "$MODE_FILE"; echo "（档位已顺带切到 smart）"; }
+
+t_ok "加工员上岗标记已写好。"
+echo
+if [ "$HOLD_SEC" -gt 0 ]; then
+  echo "  锁定到 $(t_fmt_epoch "$(( $(t_epoch) + HOLD_SEC ))" "+%H:%M")，这期间不下班。"
+else
+  echo "  规则：连续空等满 1 小时自动下班，成本归零。"
+fi
+echo
+echo "⚠️  下一步必须由会话完成：真正把加工员起起来（见 SKILL.md「起加工员」）。"
+echo "    脚本起不了子代理 —— 这个标记只是记下「该有一个加工员」，本身不干活。"

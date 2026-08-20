@@ -1,0 +1,60 @@
+#!/bin/bash
+# ccresume —— 按代号找回会话，产出恢复命令
+#
+#   ccresume <代号>      查出编号并给出恢复命令
+#   ccresume             列出所有在册会话
+#
+# 只产出命令，不替你执行 —— 恢复会话要接管终端，必须你自己在窗口里敲。
+#
+# 关窗口不等于结束协作：用下面的命令恢复，编号不变、对话记录完整回来、
+# 堆在信箱里的消息一次性全收到。直接敲 claude 开的是【另一个】会话，接不上。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+
+if [ -z "$1" ]; then
+  echo "在册会话："
+  echo
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    inbox="$SESSIONS_DIR/$id/收件箱"
+    unread=0
+    [ -d "$inbox" ] && unread=$(find "$inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    extra=""; [ "$unread" -gt 0 ] && extra="   有 ${unread} 条未读"
+    # 有代号但一个组都没进，是正常状态（代号是窗口的身份，不是组籍）——
+    # 显示成横杠会让人以为坏了，明说「未进组」
+    gs="$(t_groups_of "$id")"
+    case "$gs" in ''|'-') gs="未进组" ;; esac
+    printf '  %s %s %s%s\n' "$(t_pad "$(t_alias_of "$id")" 16)" "$(t_pad "$(t_status_of "$id")" 10)" "$gs" "$extra"
+  done <<< "$(t_index_all_ids)"
+  echo
+  echo "恢复某一个：ccresume <代号>"
+  exit 0
+fi
+
+ALIAS="$1"
+ID="$(t_id_of "$ALIAS")"
+[ -n "$ID" ] || t_die "索引里没有代号【${ALIAS}】。跑 ccresume（不带参数）看在册的有哪些。"
+
+ST="$(t_status_of "$ID")"
+CWD="$(_index_field "$ID" 4)"
+[ -z "$CWD" ] || [ "$CWD" = "-" ] && CWD="$HOME"
+
+if [ "$ST" != "已关闭" ]; then
+  echo "【${ALIAS}】现在是「${ST}」，还开着呢，不用恢复。"
+  echo "编号：$ID"
+  exit 0
+fi
+
+inbox="$SESSIONS_DIR/$ID/收件箱"
+unread=0
+[ -d "$inbox" ] && unread=$(find "$inbox" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+
+echo "【${ALIAS}】已关闭。堆着 ${unread} 条未读消息，一开起来就全收到。"
+echo
+echo "在终端里敲这一行恢复它："
+echo
+echo "    cd \"${CWD}\" && claude --resume ${ID}"
+echo
+echo "恢复之后编号不变，对话记录完整回来，协作关系一个都没断。"
+echo "进去之后记得让它重新起收件程序 —— 窗口关了收件程序就跟着没了。"

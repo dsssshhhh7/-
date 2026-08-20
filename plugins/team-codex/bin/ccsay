@@ -1,0 +1,226 @@
+#!/bin/bash
+# ccsay —— 传话台：把人交代的一句话，准确送到另一个窗口
+#
+#   ccsay <代号> --目的 "为什么发给他" "内容"          投递（新话题）
+#   ccsay <代号> --回 <消息号> --目的 "…" "内容"        回复（对方投给你那条的反馈）
+#   ccsay <代号> --目的 "…" --文件 <路径>              长正文 / 内容带特殊字符时走文件
+#   ccsay <代号> ... --留言                            对方离线也照投，等它开机看
+#
+# 跟讨论组的 cctell 是两套东西，不许混：
+#   · cctell 走「组」，有成员、有共识、有往返轮数那套规则
+#   · ccsay  走「代号」，点对点，没有组、没有成员，只有一份按日记录
+#
+# 三件在这里就把关的事：
+#   1. 对方在不在线 —— 往关着的窗口发消息**不会报错**，消息安静躺在信箱里，
+#      发的人以为传到了，其实没人看。所以默认拒发，要留言得明说。
+#   2. 必须写「目的」—— 收件方第一眼就知道这跟他什么关系，不用从正文里猜。
+#   3. 消息**带类型**（传话台投递 / 传话台回复）—— 收件方按类型走不同处理：
+#      投递要原样呈给人、可回一条；回复只呈给人、不许再回。
+#
+# ⚠️ 正文里有反引号、$、方括号、感叹号时**必须走 --文件**：
+#    直接写命令行上会被静默吃掉甚至被执行，消息照发、内容却残缺（cctell 那边踩过）。
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+t_ensure_skeleton
+t_ensure_mydir
+
+TO=""; BODY=""; BODY_FILE=""; PURPOSE=""; REPLY_TO=""; LEAVE_MSG=0; SIDE_OK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --目的|--why)    PURPOSE="$2"; shift 2 ;;
+    --回|--reply)    REPLY_TO="$2"; shift 2 ;;
+    --文件|--file)   BODY_FILE="$2"; shift 2 ;;
+    --留言|--leave)  LEAVE_MSG=1; shift ;;
+    --就是要带话|--relay-anyway) SIDE_OK=1; shift ;;
+    -*)              t_die "不认识的参数：$1" ;;
+    *)               if [ -z "$TO" ]; then TO="$1"; else BODY="$1"; fi; shift ;;
+  esac
+done
+
+ME="$(t_sid)"
+MY_ALIAS="$(t_alias_of "$ME")"
+[ -n "$MY_ALIAS" ] || t_die "你还没有代号，别人不知道这条是谁发的。先起一个：ccname <代号>（不用先进组）"
+
+[ -n "$TO" ] || t_die "用法：ccsay <代号> --目的 \"为什么发给他\" \"内容\"    （跑 ccbook 看能发给谁）"
+
+# ── 正文 ──
+if [ -n "$BODY_FILE" ]; then
+  [ -f "$BODY_FILE" ] || t_die "找不到这个文件：$BODY_FILE"
+  BODY="$(cat "$BODY_FILE")"
+fi
+[ -n "$BODY" ] || t_die "内容不能为空"
+
+# 正文写在命令行上时，查一个「被命令行吃掉内容」的指纹：
+# 反引号那对被吃掉后，「地址是 ⟨反引号⟩…⟨反引号⟩ 结束」会变成「地址是··结束」。
+# 连续两个半角空格在正常中文写作里很少见，够当信号用。
+if [ -z "$BODY_FILE" ] && printf '%s' "$BODY" | grep -q '  '; then
+  echo "⚠️  正文里出现连续两个空格 —— 可能是反引号 / \$xx 里的内容被命令行吃掉了。"
+  echo "   被吃掉时消息照常发出、不报错，句子读起来还通顺，所以最难发现。"
+  echo "   真被吃了就把正文写进文件，改用：ccsay \"$TO\" … --文件 <路径>"
+  echo
+fi
+
+[ -n "$PURPOSE" ] || {
+  echo "❌ 还差一样：为什么发给他（--目的）。" >&2
+  echo >&2
+  echo "   收件方拿到消息第一件事是判断「这跟我什么关系」，而那个判断你本来就做过一遍。" >&2
+  echo "   不写下来，等于让他再做一次。" >&2
+  echo "   例：--目的 \"确认扫描口径，这条影响你那边的实现方式\"" >&2
+  exit 2
+}
+
+# ── 收件人 ──
+TO_ID="$(t_id_of "$TO")"
+[ -n "$TO_ID" ] || {
+  echo "❌ 地址簿里没有代号【${TO}】。" >&2
+  echo "   看看能发给谁：ccbook" >&2
+  exit 1
+}
+[ "$TO_ID" = "$ME" ] && t_die "这是发给你自己的。传话台是点对点的，发给自己没有意义。"
+
+# ── 同一个组里的人，不走传话台 ──
+#
+# 两人同在一个组，却用传话台说话，那段对话就**不在组流水里**：
+#   · 组里其他人永远不知道你们谈过什么
+#   · 往返轮数那道闸管不到，两个会话可以一直私聊
+#   · 谈出来的结论没有路进共识 —— 而共识是「中途加入的人只读这一份就能追上」的那一份
+# 这正是这套东西要治的病：传着传着就漏了，只不过这次漏在两个 AI 之间。
+#
+# 但**人让你带的一句话**是另一回事：它不是组里的活，只是借这个窗口把话送到那个人面前。
+# 那种情况加 --就是要带话 明说一次。默认拦下，是因为「顺手私聊」比「人真让你带话」常见得多。
+if [ "$SIDE_OK" -ne 1 ]; then
+  _MY_G="$(t_groups_of "$ME")"; [ "$_MY_G" = "-" ] && _MY_G=""
+  _TO_G="$(t_groups_of "$TO_ID")"; [ "$_TO_G" = "-" ] && _TO_G=""
+  _SHARED=""
+  if [ -n "$_MY_G" ] && [ -n "$_TO_G" ]; then
+    while IFS= read -r _g; do
+      [ -z "$_g" ] && continue
+      printf '%s' "$_TO_G" | tr ',' '\n' | grep -qxF -- "$_g" && _SHARED="${_SHARED}${_g}
+"
+    done <<< "$(printf '%s' "$_MY_G" | tr ',' '\n')"
+  fi
+  if [ -n "$_SHARED" ]; then
+    echo "❌ 你和【${TO}】在同一个组里，这条不该走传话台。" >&2
+    echo >&2
+    echo "   同在这些组：" >&2
+    printf '%s' "$_SHARED" | sed '/^$/d; s/^/     · /' >&2
+    echo >&2
+    echo "   走传话台，这段话就**不进组流水**：组里其他人不知道你们谈过，" >&2
+    echo "   往返轮数管不到，谈出来的结论也没有路进共识 —— 而共识是「中途加入的人" >&2
+    echo "   只读这一份就能追上进度」的那一份。" >&2
+    echo >&2
+    echo "   改用组里发：" >&2
+    echo "     cctell \"$(printf '%s' "$_SHARED" | sed '/^$/d' | head -1)\" --给 \"${TO}\" --目的 \"${PURPOSE}\" \"<内容>\"" >&2
+    echo >&2
+    echo "   例外只有一种：**人让你把一句话带给那个窗口前的人**，不是组里的活。" >&2
+    echo "   确实是那种，加一句 --就是要带话 重发。" >&2
+    exit 5
+  fi
+fi
+
+# ── 在不在线 ──
+if ! t_is_online "$TO_ID" && [ "$LEAVE_MSG" -ne 1 ]; then
+  echo "❌ 【${TO}】不在线（$(t_online_text "$TO_ID")），这条没发。" >&2
+  echo >&2
+  echo "   发过去**不会报错**，消息会一直躺在它信箱里没人看 —— 你会以为传到了。" >&2
+  echo "   三条路：" >&2
+  echo "     · 让那个窗口的人说句话 —— 它可能只是**安静太久自动下班了**，说一句就自己起回来" >&2
+  echo "     · 把它找回来：ccresume \"${TO}\"" >&2
+  echo "     · 改发给别人：ccbook 看谁在线" >&2
+  echo >&2
+  echo "   确实要留着让它下次开机再看，加上 --留言 重发一次。" >&2
+  exit 3
+fi
+
+# ── 类型：投递还是回复；回复要验凭据 ──
+#
+# 「每条投递只能回一次、回复不产生回复权」这条规矩，就在这里做实。
+# 查的全是我们自己写下来的数据（传话记录 + 自己的台账），不猜意图、
+# 不依赖 Claude Code 的任何内部格式。
+if [ -n "$REPLY_TO" ]; then
+  KIND="传话台回复"
+
+  # ③ 回过没有 —— 先查这个，最省事
+  if t_reply_used "$REPLY_TO"; then
+    echo "❌ ${REPLY_TO} 这条你已经回过一次了，不能再回。" >&2
+    echo >&2
+    echo "   传话台的规矩：**每条投递只能回一条**，一来一回就到此为止。" >&2
+    echo "   还有话要说，就等人来交代 —— 由人起头的投递不受这条限制。" >&2
+    exit 4
+  fi
+
+  # ①② 这条真投给过我吗、是不是「投递」
+  REC="$(t_talk_index | grep "^${REPLY_TO}|" | head -1)"
+  if [ -z "$REC" ]; then
+    echo "❌ 传话记录里没有 ${REPLY_TO} 这条消息，回不了。" >&2
+    echo "   可能是消息号打错了，或者那条已经超过保留期（7 天）被清掉了。" >&2
+    exit 4
+  fi
+  R_KIND="$(printf '%s' "$REC" | cut -d'|' -f2)"
+  R_FROM="$(printf '%s' "$REC" | cut -d'|' -f3)"
+  R_TO="$(printf '%s' "$REC" | cut -d'|' -f4)"
+
+  if [ "$R_TO" != "$ME" ]; then
+    echo "❌ ${REPLY_TO} 这条不是投给你的，你回不了它。" >&2
+    echo "   （能回的只有别人投给**你**的那些）" >&2
+    exit 4
+  fi
+  if [ "$R_KIND" != "投递" ]; then
+    echo "❌ ${REPLY_TO} 本身就是一条**回复**，回复不能再回。" >&2
+    echo >&2
+    echo "   这一刀是有意的：否则你回我、我回你，每一步都「只回了一次」，还是没完没了。" >&2
+    echo "   **只有人起头的投递才带一次回复权。**这轮到此为止，要继续得由人交代。" >&2
+    exit 4
+  fi
+  if [ -n "$R_FROM" ] && [ "$R_FROM" != "未知" ] && [ "$R_FROM" != "$TO_ID" ]; then
+    echo "❌ ${REPLY_TO} 是【$(t_display "$R_FROM")】投给你的，回复要回给它，不能回给【${TO}】。" >&2
+    echo "   想告诉别人，那是另一条**新投递**（不带 --回）。" >&2
+    exit 4
+  fi
+else
+  KIND="传话台投递"
+fi
+
+MID="$(t_msgid)"
+FULL_BODY="$BODY"
+[ -n "$REPLY_TO" ] && FULL_BODY="（回复消息号 ${REPLY_TO}）
+${BODY}"
+
+t_deliver "$TO_ID" "传话台" "$MY_ALIAS" "$ME" "$FULL_BODY" 0 否 "$KIND" "$MID" 否 "$PURPOSE" >/dev/null
+
+t_talk_append "$KIND" "$MID" "$MY_ALIAS" "$TO" "$PURPOSE" "$BODY" "$ME" "$TO_ID"
+
+# 回复发出去了才销账 —— 发失败还留着回复权，不然人白丢一次机会
+[ -n "$REPLY_TO" ] && t_reply_mark "$REPLY_TO"
+
+# 发得出去 ≠ 收得回来：**自己的**收件程序不在岗的话，对方回的那条你收不到，
+# 而且你在别人的地址簿里显示为「离线」，别人也传不进来。
+# 这是最该检查的时刻 —— 你正在用传话台，说明你就在协作里。
+if ! t_watcher_running; then
+  echo
+  t_warn "你自己的收件程序不在岗 —— 这条发出去了，但**对方回的那条你收不到**。"
+  echo "   🔔 【会话看这里】立刻用盯梢工具（Monitor）起它，不用回头问人：" >&2
+  echo "        命令：$(t_bin_dir)/watcher.sh" >&2
+  echo "        persistent：true" >&2
+  echo "        描述：本会话收件箱的新消息" >&2
+fi
+
+echo
+if [ "${TEAM_RUNTIME}" = "codex" ]; then
+  echo "📝 已写入【${TO}】的共享信箱；还必须由 team Skill 调用 Codex 原生任务消息，成功后才算已送达。"
+elif [ "$KIND" = "传话台回复" ]; then
+  t_ok "已回给【${TO}】（回的是 ${REPLY_TO}）"
+elif t_is_online "$TO_ID"; then
+  t_ok "已送到【${TO}】（在线）"
+else
+  # 对方不在线时**别说「已送到」**：什么都没送到，只是丢进了它的信箱。
+  # 第一行是人真正会读的那行，这套东西整个的立意就是不让人误以为传到了。
+  echo "📮 已留在【${TO}】的信箱里（${TO} $(t_online_text "$TO_ID")，没人收）"
+fi
+echo
+echo "  消息号 ${MID}｜类型 ${KIND}"
+echo "  记录：$(t_talk_log)"
+if [ "$LEAVE_MSG" -eq 1 ] && ! t_is_online "$TO_ID"; then
+  echo
+  echo "⚠️  它现在不在线，这条是留言 —— 等它下次开机、起了收件程序才会看到。"
+fi
